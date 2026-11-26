@@ -48,6 +48,7 @@ mod placement;
 mod primitive;
 pub mod query;
 pub mod queue;
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

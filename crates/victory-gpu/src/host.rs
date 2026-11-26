@@ -535,7 +535,7 @@ pub(crate) mod tests {
             })
             .collect();
         let owned: Vec<_> = textures.iter().map(|&t| crate::resource::owned(t).expect("may be given up")).collect();
-        let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
+        let (idle_frames, idle_ms) = (crate::residency::IDLE_FRAMES, crate::residency::IDLE_MS);
         {
             // No submission takes the marks meanwhile.
             let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1263,6 +1263,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Host textures these lists use that were evicted past the card's
+        // budget are made resident before they run (`crate::residency`).
+        crate::residency::before_running(runs);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1898,6 +1901,12 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
         }
+    }
+
+    /// The host textures the list uses (`crate::residency`).
+    pub(crate) fn textures(&self) -> Vec<std::sync::Arc<crate::resource::HostTexture>> {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.values().map(|(_, _, copy)| copy.clone()).collect()
     }
 
     /// The list is one of ours (uploads): what it uses is no use of the
@@ -3109,6 +3118,7 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            crate::residency::log(report_frames);
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
