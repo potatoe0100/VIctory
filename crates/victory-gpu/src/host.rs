@@ -6613,13 +6613,14 @@ impl Host {
         text
     }
 
-    /// Moves the debug layer's messages into our log; returns the first
+    /// Moves the debug layer's messages into our log; returns the error
+    /// that removed the device if one did (`removal_cause`), else the first
     /// error among them.
     pub(crate) fn log_messages(&self) -> Option<String> {
         let Some(queue) = &self.messages else {
             return None;
         };
-        let mut first_error = None;
+        let mut seen = Vec::new();
         // SAFETY: each message is read into a buffer of the size the queue
         // reports, then the queue is emptied.
         unsafe {
@@ -6636,14 +6637,12 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
-                    }
+                    seen.push((m.ID, m.Severity, text.to_owned()));
                 }
             }
             queue.ClearStoredMessages();
         }
-        first_error
+        removal_cause(&seen)
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
@@ -12152,3 +12151,156 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+/// What to report of the debug layer's messages. When the layer removed
+/// the device (`ID3D12Device::RemoveDevice`, ids 232 and 233): the errors
+/// of the call just before it, then the first error if it was another
+/// call's. Otherwise the first error. A removal often follows errors that
+/// do not remove it: on an RTX 4060 (driver 621.14) a texture the host
+/// refuses (`CreateCommittedResource`, `GetResourceAllocationInfo`) is an
+/// error and a failed call, but only a view the host cannot make
+/// (`CreateUnorderedAccessView` ids 342 and 340, `CreateRenderTargetView`
+/// ids 36 and 42) removes the device, so the first error alone named the
+/// wrong call (#3237).
+fn removal_cause(
+    messages: &[(D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String)],
+) -> Option<String> {
+    let error = |m: &&(D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String)| {
+        m.1.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+    };
+    let first = messages.iter().find(error).map(|m| m.2.as_str());
+    let removal = messages.iter().position(|(id, ..)| {
+        *id == D3D12_MESSAGE_ID_DEVICE_REMOVAL_PROCESS_AT_FAULT
+            || *id == D3D12_MESSAGE_ID_DEVICE_REMOVAL_PROCESS_POSSIBLY_AT_FAULT
+    });
+    let Some(at) = removal else {
+        return first.map(str::to_owned);
+    };
+    // The call a message is about: "ID3D12Device::CreateUnorderedAccessView".
+    let call = |text: &str| text.split(':').take(3).collect::<Vec<_>>().join(":");
+    let before: Vec<&str> = messages[..at]
+        .iter()
+        .filter(error)
+        .map(|m| m.2.as_str())
+        .collect();
+    let Some(&last) = before.last() else {
+        return first.map(str::to_owned);
+    };
+    let from = before
+        .iter()
+        .rposition(|t| call(t) != call(last))
+        .map_or(0, |i| i + 1);
+    let mut text = before[from..].join(" / ");
+    if let Some(first) = first
+        && !before[from..].contains(&first)
+    {
+        text.push_str(&format!(" (first error: {first})"));
+    }
+    Some(text)
+}
+
+#[cfg(test)]
+mod removal_cause_tests {
+    use super::*;
+
+    fn m(
+        id: i32,
+        severity: D3D12_MESSAGE_SEVERITY,
+        text: &str,
+    ) -> (D3D12_MESSAGE_ID, D3D12_MESSAGE_SEVERITY, String) {
+        (D3D12_MESSAGE_ID(id), severity, text.to_owned())
+    }
+
+    /// The order an RTX 4060 gives: a refused texture (599), then the view
+    /// that removes the device (342 and 340), then the removal (232). The
+    /// report leads with the view's errors and keeps the first error.
+    #[test]
+    fn a_removal_names_the_call_just_before_it() {
+        let e = D3D12_MESSAGE_SEVERITY_ERROR;
+        let messages = [
+            m(
+                599,
+                e,
+                "ID3D12Device::GetResourceAllocationInfo: B5G5R5A1_UNORM unordered",
+            ),
+            m(
+                342,
+                e,
+                "ID3D12Device::CreateUnorderedAccessView: B5G5R5A1_UNORM typed",
+            ),
+            m(
+                340,
+                e,
+                "ID3D12Device::CreateUnorderedAccessView: no unordered flag",
+            ),
+            m(
+                232,
+                e,
+                "ID3D12Device::RemoveDevice: DXGI_ERROR_INVALID_CALL",
+            ),
+            m(1, D3D12_MESSAGE_SEVERITY_WARNING, "later"),
+        ];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some(
+                "ID3D12Device::CreateUnorderedAccessView: B5G5R5A1_UNORM typed / \
+                 ID3D12Device::CreateUnorderedAccessView: no unordered flag \
+                 (first error: ID3D12Device::GetResourceAllocationInfo: B5G5R5A1_UNORM unordered)"
+            )
+        );
+    }
+
+    /// When the call before the removal is the first error, it is named
+    /// once.
+    #[test]
+    fn the_first_error_is_not_repeated() {
+        let e = D3D12_MESSAGE_SEVERITY_ERROR;
+        let messages = [
+            m(
+                36,
+                e,
+                "ID3D12Device::CreateRenderTargetView: B4G4R4A4_UNORM",
+            ),
+            m(
+                232,
+                e,
+                "ID3D12Device::RemoveDevice: DXGI_ERROR_INVALID_CALL",
+            ),
+        ];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some("ID3D12Device::CreateRenderTargetView: B4G4R4A4_UNORM")
+        );
+    }
+
+    /// Without a removal message the first error is reported, as before;
+    /// warnings and messages are never the cause.
+    #[test]
+    fn without_a_removal_the_first_error_is_reported() {
+        let messages = [
+            m(1, D3D12_MESSAGE_SEVERITY_WARNING, "a warning"),
+            m(599, D3D12_MESSAGE_SEVERITY_ERROR, "first"),
+            m(36, D3D12_MESSAGE_SEVERITY_CORRUPTION, "second"),
+        ];
+        assert_eq!(removal_cause(&messages).as_deref(), Some("first"));
+        assert_eq!(
+            removal_cause(&[m(1, D3D12_MESSAGE_SEVERITY_INFO, "info")]),
+            None
+        );
+        assert_eq!(removal_cause(&[]), None);
+    }
+
+    /// A removal with no error before it reports the first error, which
+    /// may be the removal message itself.
+    #[test]
+    fn a_removal_without_an_error_before_it_reports_the_first_error() {
+        let messages = [m(
+            233,
+            D3D12_MESSAGE_SEVERITY_ERROR,
+            "ID3D12Device::RemoveDevice: possibly at fault",
+        )];
+        assert_eq!(
+            removal_cause(&messages).as_deref(),
+            Some("ID3D12Device::RemoveDevice: possibly at fault")
+        );
+    }
+}
