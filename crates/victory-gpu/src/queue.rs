@@ -563,6 +563,12 @@ extern "system" fn present(
             }
         }
         if !resources.is_empty() {
+            // The present's copy list runs outside `Host::execute`: planes
+            // evicted past the budget are made resident here (room made if
+            // the device refuses), as a submission's are.
+            crate::residency::before_using(
+                resources.iter().filter_map(|&(resource, ..)| crate::resource::host_copy(resource)).collect(),
+            );
             let sources: Vec<(&_, u32)> = resources
                 .iter()
                 .map(|(_, tex, state, _)| (tex, *state))

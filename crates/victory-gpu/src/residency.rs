@@ -557,13 +557,22 @@ pub(crate) fn before_running(lists: &[&crate::host::HostList]) {
     if all_resident() {
         return;
     }
+    before_using(lists.iter().flat_map(|l| l.textures()).collect());
+}
+
+/// Before GPU work that names host textures `used` outside a submission's
+/// lists (the present's own copy list): the same as [`before_running`].
+#[cfg(windows)]
+pub(crate) fn before_using(used: Vec<Arc<HostTexture>>) {
+    if all_resident() {
+        return;
+    }
     let Some(host) = crate::host::host() else {
         return;
     };
     let mut named = std::collections::HashSet::new();
-    let used: Vec<Arc<HostTexture>> = lists
-        .iter()
-        .flat_map(|l| l.textures())
+    let used: Vec<Arc<HostTexture>> = used
+        .into_iter()
         .filter(|t| named.insert(Arc::as_ptr(t) as usize))
         .collect();
     // The evicted ones made resident: the error, how many, their bytes.
@@ -965,6 +974,21 @@ mod device_tests {
         let used = crate::resource::host_copy(texture).expect("its host texture");
         assert!(Arc::ptr_eq(&used, &copy), "no new host texture");
         assert!(copy.residency.is_resident(), "a use made it resident");
+    }
+
+    #[test]
+    fn work_outside_a_submission_makes_its_evicted_textures_resident() {
+        if crate::host::host().is_none() || !super::available() {
+            return;
+        }
+        let memory = vec![0u8; 32 << 20];
+        let texture = committed_texture(&memory);
+        let copy = crate::resource::host_copy(texture).expect("a host texture");
+        evict_now(texture);
+        assert!(!copy.residency.is_resident(), "evicted");
+        // As the present does for its planes before its own copy list runs.
+        super::before_using(vec![crate::resource::made_copy(texture).expect("kept")]);
+        assert!(copy.residency.is_resident(), "made resident before use");
     }
 
     #[test]
