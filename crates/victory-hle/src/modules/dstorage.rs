@@ -636,7 +636,13 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let asked = std::env::var("VICTORY_DSTORAGE_WORKERS").ok();
+        let overridden = asked.as_deref().and_then(worker_override);
+        if let (Some(asked), None) = (&asked, overridden) {
+            tracing::warn!(%asked, "dstorage: VICTORY_DSTORAGE_WORKERS is not 1..=64, ignored");
+        }
+        let workers = overridden
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -645,9 +651,17 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            overridden = overridden.is_some(),
+            "dstorage: workers"
+        );
     });
     Some(scheduler)
+}
+
+fn worker_override(text: &str) -> Option<usize> {
+    text.trim().parse().ok().filter(|n| (1..=64).contains(n))
 }
 
 impl Scheduler {
@@ -1780,6 +1794,15 @@ mod tests {
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
         method(unsafe { &*object.cast::<Object>() }, slot)
+    }
+
+    #[test]
+    fn worker_override_takes_1_to_64() {
+        assert_eq!(worker_override("1"), Some(1));
+        assert_eq!(worker_override(" 64 "), Some(64));
+        assert_eq!(worker_override("0"), None);
+        assert_eq!(worker_override("65"), None);
+        assert_eq!(worker_override("many"), None);
     }
 
     fn factory() -> *mut c_void {
