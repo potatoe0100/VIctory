@@ -29,7 +29,9 @@ scripts\play-4060.ps1 -Exe <path of your copy's executable>
 ```
 
 Options: `-Resolution 480` (faster, softer) or `-Resolution 720` (sharper, slower); `-Quality` (fewer stretched
-bodies, slower); `-NoSmoothMotion`.
+bodies, slower); `-NoSmoothMotion`. If video memory runs out, try
+`-More @{VICTORY_LEVELS_ON_DEMAND='1'}`: textures take memory only for the levels the game holds. Its test passes on
+an RTX 4060, but it hasn't been tried in the game on this branch.
 
 ## Reporting how it runs
 
