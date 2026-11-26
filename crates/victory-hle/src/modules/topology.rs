@@ -147,7 +147,11 @@ fn rotate(mask: usize, shift: u32, left: bool, count: u32) -> usize {
 /// `processor` moved by the pin shift (back, when not `left`) within the CPU
 /// count; numbers past it (queries, errors) pass unchanged.
 fn shift_processor(processor: u32, left: bool) -> u32 {
-    let (shift, count) = (pin_shift(), cpu_count());
+    shift_processor_by(processor, left, pin_shift(), cpu_count())
+}
+
+/// `shift_processor` with the shift and CPU count passed in.
+fn shift_processor_by(processor: u32, left: bool, shift: u32, count: u32) -> u32 {
     if shift == 0 || processor >= count {
         processor
     } else if left {
@@ -326,6 +330,27 @@ mod tests {
         assert!(seen.note("b", 1));
         assert_eq!(seen.totals["a"], 3);
         assert_eq!(seen.totals["b"], 1);
+    }
+
+    #[test]
+    fn ideal_processor_shift_keeps_smt_pairs_and_wraps() {
+        // 16 logical CPUs, 8 cores with SMT (CPU 2k and 2k+1 share core k).
+        let (shift, count) = (2, 16);
+        let moved: Vec<u32> = (0..count).map(|p| shift_processor_by(p, true, shift, count)).collect();
+        assert_eq!(moved[..4], [2, 3, 4, 5]);
+        assert_eq!(moved[14..], [0, 1]);
+        let mut sorted = moved.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..count).collect::<Vec<_>>());
+        for p in 0..count {
+            // Distinct cores stay distinct, siblings stay siblings.
+            assert_eq!(moved[p as usize] / 2, (p / 2 + 1) % 8);
+            assert_eq!(shift_processor_by(moved[p as usize], false, shift, count), p);
+            assert_eq!(rotate(1 << p, shift, true, count), 1 << moved[p as usize]);
+        }
+        assert_eq!(shift_processor_by(u32::MAX, true, shift, count), u32::MAX);
+        assert_eq!(shift_processor_by(16, false, shift, count), 16);
+        assert_eq!(shift_processor_by(5, true, 0, count), 5);
     }
 
     #[test]
