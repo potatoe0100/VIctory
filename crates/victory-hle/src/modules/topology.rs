@@ -1,6 +1,6 @@
 //! Measurement (diagnostics builds): how the title looks at the CPU and
 //! places its threads. Every call goes to the host unchanged, except
-//! affinity masks under `VICTORY_PIN_SHIFT`.
+//! affinity masks and ideal processors under `VICTORY_PIN_SHIFT`.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -19,6 +19,9 @@ unsafe extern "system" {
     fn last_error() -> u32;
     #[link_name = "SetLastError"]
     fn set_last_error(code: u32);
+    fn GetCurrentProcess() -> Handle;
+    fn GetProcessAffinityMask(process: Handle, process_mask: *mut usize, system_mask: *mut usize)
+    -> i32;
 }
 
 #[derive(Default)]
@@ -94,33 +97,74 @@ macro_rules! forward {
     };
 }
 
-/// Logical CPUs the masks rotate by (`VICTORY_PIN_SHIFT`, 0..=15, default 0):
-/// the title pins to CPUs 0-3, where Windows runs most ISRs and DPCs.
+/// Logical CPUs the process may run on (its affinity mask's count), read once.
+/// shortcut: assumes the mask starts at CPU 0 with no gaps, true unless the
+/// process is started with a restricted affinity; read the bits then.
+fn cpu_count() -> u32 {
+    static COUNT: OnceLock<u32> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let (mut process, mut system) = (0usize, 0usize);
+        // SAFETY: the current process's pseudo-handle and two locals.
+        let ok = unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) };
+        if ok != 0 && process != 0 { process.count_ones() } else { 16 }
+    })
+}
+
+/// Logical CPUs the masks rotate by (`VICTORY_PIN_SHIFT`, even and below the
+/// CPU count, default 0): the title pins to CPUs 0-3, where Windows runs most
+/// ISRs and DPCs. Odd shifts would split SMT pairs.
 fn pin_shift() -> u32 {
     static SHIFT: OnceLock<u32> = OnceLock::new();
     *SHIFT.get_or_init(|| {
+        let count = cpu_count();
         let asked = std::env::var("VICTORY_PIN_SHIFT").ok();
         let shift = asked.as_deref().map_or(Some(0), |text| {
-            text.trim().parse().ok().filter(|n| (0..16).contains(n))
+            text.trim().parse().ok().filter(|n: &u32| *n < count && n % 2 == 0)
         });
         if shift.is_none() {
-            tracing::warn!(?asked, "topology: VICTORY_PIN_SHIFT is not 0..=15, ignored");
+            tracing::warn!(
+                ?asked,
+                count,
+                "topology: VICTORY_PIN_SHIFT is not even and below the CPU count (keeps SMT pairs), ignored"
+            );
         }
         shift.unwrap_or(0)
     })
 }
 
-/// `mask` rotated by `shift` within the 16 logical CPUs (left, or right to
-/// undo): same count, never empty. Masks past CPU 15, or empty, pass unchanged.
-fn rotate(mask: usize, shift: u32, left: bool) -> usize {
-    match u16::try_from(mask) {
-        Ok(bits) if bits != 0 && shift != 0 => usize::from(if left {
-            bits.rotate_left(shift)
-        } else {
-            bits.rotate_right(shift)
-        }),
-        _ => mask,
+/// `mask` rotated by `shift` within `count` logical CPUs (left, or right to
+/// undo): same count, never empty. Masks past the last CPU, or empty, pass
+/// unchanged.
+fn rotate(mask: usize, shift: u32, left: bool, count: u32) -> usize {
+    let full = if count >= usize::BITS { usize::MAX } else { (1 << count) - 1 };
+    if mask == 0 || shift == 0 || shift >= count || mask & !full != 0 {
+        return mask;
     }
+    let by = if left { shift } else { count - shift };
+    ((mask << by) | (mask >> (count - by))) & full
+}
+
+/// `processor` moved by the pin shift (back, when not `left`) within the CPU
+/// count; numbers past it (queries, errors) pass unchanged.
+fn shift_processor(processor: u32, left: bool) -> u32 {
+    let (shift, count) = (pin_shift(), cpu_count());
+    if shift == 0 || processor >= count {
+        processor
+    } else if left {
+        (processor + shift) % count
+    } else {
+        (processor + count - shift) % count
+    }
+}
+
+/// A stored `PROCESSOR_NUMBER` (group low, number above it) with its number
+/// shifted; group 0 only.
+fn shift_processor_number(stored: u32, left: bool) -> u32 {
+    if stored & 0xffff != 0 {
+        return stored;
+    }
+    let number = shift_processor((stored >> 16) & 0xff, left);
+    (stored & !0xff_0000) | (number << 16)
 }
 
 pub extern "system" fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usize {
@@ -129,7 +173,8 @@ pub extern "system" fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usi
         fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usize;
     }
     let shift = pin_shift();
-    let shifted = rotate(mask, shift, true);
+    let count = cpu_count();
+    let shifted = rotate(mask, shift, true, count);
     // SAFETY: the title's thread handle and a mask of the same CPU count.
     let previous = unsafe { SetThreadAffinityMask(thread, shifted) };
     if shifted != mask {
@@ -152,19 +197,46 @@ pub extern "system" fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usi
     }
     note("SetThreadAffinityMask", mask as u64);
     // The title may restore the previous mask; hand it back in its own terms.
-    rotate(previous, shift, false)
+    rotate(previous, shift, false, count)
 }
-forward!(SetThreadIdealProcessor(thread: Handle, processor: u32) -> u32, processor.into());
-// Value: the `PROCESSOR_NUMBER` as stored (group low, number above it).
-forward!(
-    SetThreadIdealProcessorEx(thread: Handle, ideal: *const u32, previous: *mut u32) -> i32,
-    if ideal.is_null() {
-        u64::MAX
-    } else {
-        // SAFETY: not null, and the title passes its `PROCESSOR_NUMBER` there.
-        unsafe { ideal.read_unaligned() }.into()
+
+/// Shifted like the masks, so ideal and affinity stay on the same CPUs.
+pub extern "system" fn SetThreadIdealProcessor(thread: Handle, processor: u32) -> u32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadIdealProcessor(thread: Handle, processor: u32) -> u32;
     }
-);
+    // SAFETY: the title's thread handle and a processor number below the count.
+    let previous = unsafe { SetThreadIdealProcessor(thread, shift_processor(processor, true)) };
+    note("SetThreadIdealProcessor", processor.into());
+    // The failure value (u32::MAX) is past the count and passes unchanged.
+    shift_processor(previous, false)
+}
+
+// Value: the `PROCESSOR_NUMBER` as stored (group low, number above it).
+pub extern "system" fn SetThreadIdealProcessorEx(
+    thread: Handle,
+    ideal: *const u32,
+    previous: *mut u32,
+) -> i32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadIdealProcessorEx(thread: Handle, ideal: *const u32, previous: *mut u32)
+        -> i32;
+    }
+    // SAFETY: not null, and the title passes its `PROCESSOR_NUMBER` there.
+    let original = (!ideal.is_null()).then(|| unsafe { ideal.read_unaligned() });
+    let shifted = original.map(|stored| shift_processor_number(stored, true));
+    let shifted_ptr = shifted.as_ref().map_or(std::ptr::null(), |stored| stored as *const u32);
+    // SAFETY: the title's handle and out pointer, and our copy of its number.
+    let result = unsafe { SetThreadIdealProcessorEx(thread, shifted_ptr, previous) };
+    if result != 0 && !previous.is_null() {
+        // SAFETY: the host just wrote a `PROCESSOR_NUMBER` there.
+        unsafe { previous.write_unaligned(shift_processor_number(previous.read_unaligned(), false)) };
+    }
+    note("SetThreadIdealProcessorEx", original.map_or(u64::MAX, u64::from));
+    result
+}
 // Negative priorities show sign-extended.
 forward!(SetThreadPriority(thread: Handle, priority: i32) -> i32, priority as u64);
 forward!(GetSystemInfo(info: *mut c_void) -> (), 0);
@@ -257,19 +329,22 @@ mod tests {
     }
 
     #[test]
-    fn rotation_wraps_in_16_cpus_and_keeps_the_count() {
-        assert_eq!(rotate(0xf, 2, true), 0x3c);
-        assert_eq!(rotate(0xc000, 2, true), 0x3);
-        assert_eq!(rotate(0x3, 2, false), 0xc000);
-        assert_eq!(rotate(0xffff, 5, true), 0xffff);
-        assert_eq!(rotate(0x1_0001, 2, true), 0x1_0001);
-        assert_eq!(rotate(0, 2, true), 0);
-        assert_eq!(rotate(0x7, 0, true), 0x7);
+    fn rotation_wraps_in_the_cpu_count_and_keeps_the_count() {
+        assert_eq!(rotate(0xf, 2, true, 16), 0x3c);
+        assert_eq!(rotate(0xc000, 2, true, 16), 0x3);
+        assert_eq!(rotate(0x3, 2, false, 16), 0xc000);
+        assert_eq!(rotate(0xffff, 5, true, 16), 0xffff);
+        assert_eq!(rotate(0x1_0001, 2, true, 16), 0x1_0001);
+        assert_eq!(rotate(0, 2, true, 16), 0);
+        assert_eq!(rotate(0x7, 0, true, 16), 0x7);
+        assert_eq!(rotate(0xc00, 2, true, 12), 0x3);
+        assert_eq!(rotate(0x1000, 2, true, 12), 0x1000);
+        assert_eq!(rotate(1 << 63, 2, true, 64), 0x2);
         for mask in 1..=0xffffusize {
-            let shifted = rotate(mask, 3, true);
+            let shifted = rotate(mask, 3, true, 16);
             assert_ne!(shifted, 0);
             assert_eq!(shifted.count_ones(), mask.count_ones());
-            assert_eq!(rotate(shifted, 3, false), mask);
+            assert_eq!(rotate(shifted, 3, false, 16), mask);
         }
     }
 
