@@ -2696,6 +2696,10 @@ mod parts_tests {
 }
 
 #[cfg(test)]
+#[path = "watch_stress.rs"]
+mod stress;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
@@ -3375,7 +3379,7 @@ mod tests {
     /// A pagefile section mapped twice: two views of the same physical
     /// pages, the second left for the test; the section handle, the two
     /// addresses.
-    fn two_views(bytes: usize) -> (usize, usize, usize) {
+    pub(super) fn two_views(bytes: usize) -> (usize, usize, usize) {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
@@ -3404,7 +3408,7 @@ mod tests {
 
     /// The section of [`two_views`] is closed and its views unmapped; the
     /// guard is told they are gone first.
-    fn drop_views(section: usize, views: &[usize], bytes: usize) {
+    pub(super) fn drop_views(section: usize, views: &[usize], bytes: usize) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
