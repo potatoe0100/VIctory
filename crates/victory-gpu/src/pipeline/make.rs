@@ -88,6 +88,7 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
@@ -308,6 +309,7 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -320,6 +322,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    waiting.end();
     if wait_once() && p.made.get().is_none() {
         let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
         if Duration::from_micros(before) + waited >= budget {
