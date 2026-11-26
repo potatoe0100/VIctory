@@ -22,6 +22,15 @@ Rule for adding anything: it must fix or prevent something specific on an 8 GB N
 | #2461 NVIDIA view heap cap | Own `probe_view_limit`: shaders clamp view indices to the capped heap's null slot, and `VICTORY_DYNAMIC_SLOTS` takes more dynamic slots on a capped heap. The heap tests that fail on upstream main all pass here on the 4060. |
 | #1215 fast copy-back | `NtWriteVirtualMemory` copy-back in `host.rs` |
 | Texture budget | `VICTORY_TEXTURE_BUDGET_MB`, and by default textures stop at 90% of the budget Windows reports |
+| #1272 mip-drop | "Held levels" (`VICTORY_HELD_LEVELS`, on by default): a host copy starts at the first level the title's views show, so levels the title doesn't hold take no card memory (1.2-1.6 GB shown of 6.3-6.7 GB in the fork's recorded frames). No quality loss, unlike dropping levels the title does use. Optional "levels on demand" (`VICTORY_LEVELS_ON_DEMAND=1`, off) goes further with reserved textures. |
+| #2872 evict past budget | Idle host copies are let go and remade when used, and new copies wait for room under the budget |
+
+## Not ported (yet)
+
+| PR | Why |
+| --- | --- |
+| #1272 mip-drop (rebased branch `mipdrop-1272-rebased`) | Clashes with the fork's held-levels code in the exact place that shifts a host copy's level 0 (views, read-back, uploads). Both at once risks the same off-by-levels read-back bug found in #1272's review. Port only if testers on 8 GB see texture creation refused (E_OUTOFMEMORY) in their logs. |
+| #2872 evict (branch `evict-2872-present-fix`) | Overlaps the fork's let-go-idle sweep and its room checks; 1,200 lines into the same resource code. Port only if testers see the card stuck over budget. |
 
 ## Left out
 

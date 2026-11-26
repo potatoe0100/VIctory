@@ -5453,6 +5453,34 @@ mod window_tests {
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
     }
 
+    /// `scripts/play-4060.ps1`'s card buffer copies (768 MiB), the room kept
+    /// for render targets (3,072 MiB by default) and the texture floor fit
+    /// under the textures' line (90 %) of the budget this machine's card
+    /// reports; printed, so a run on an 8 GB card shows its numbers.
+    #[test]
+    fn the_8gb_launcher_settings_fit_the_reported_budget() {
+        const MIB: u64 = 1 << 20;
+        let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let (_, card) = resolve_card_limits(Some(budget), None, Some(768));
+        let targets = 3072 * MIB;
+        let floor = (2u64 << 30).min(budget / 4);
+        let line = budget / 100 * 90;
+        eprintln!(
+            "video memory budget {} MiB (in use {} MiB); card buffers {} + render targets {} + texture floor {} = {} MiB, line {} MiB",
+            budget / MIB,
+            used / MIB,
+            card / MIB,
+            targets / MIB,
+            floor / MIB,
+            (card + targets + floor) / MIB,
+            line / MIB
+        );
+        assert!(card + targets + floor < line, "the 8 GB settings do not fit this card's budget");
+    }
+
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
     #[test]
