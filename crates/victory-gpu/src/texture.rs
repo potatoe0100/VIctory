@@ -45,8 +45,11 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice on the host copy.
     mips: u32,
+    /// Top console mips omitted from the host copy (`crate::resource`'s
+    /// mip drop): host mip `m` is console mip `m + mip_drop`.
+    mip_drop: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -69,16 +72,17 @@ struct Last {
     hashes: Vec<Option<blake3::Hash>>,
 }
 
-/// Per subresource of `layout` (`mips` per array slice; a 3D texture's
-/// are its mips), the bytes of the texture's memory it lies in, rounded out
-/// to the layout's blocks; empty if the layout cannot say.
-fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Vec<(usize, usize)> {
+/// Per host subresource (`mips` per array slice on the host, the top
+/// `mip_drop` console mips left out; a 3D texture's are its mips), the bytes
+/// of the texture's memory it lies in, rounded out to the layout's blocks;
+/// empty if the layout cannot say.
+fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32, mip_drop: u32) -> Vec<(usize, usize)> {
     use victory_formats::texture::Dimension;
     let d = &layout.desc;
     let block = layout.alignment.max(256);
     (0..count)
         .map(|i| {
-            let (mip, slice) = (i % mips, i / mips);
+            let (mip, slice) = (i % mips + mip_drop, i / mips);
             let m = layout.mips.get(mip as usize)?;
             let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
             let first = layout.offset(mip, 0, 0, z0).ok()?;
@@ -223,6 +227,23 @@ unsafe impl Sync for Staging {}
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
         list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+/// A partial host copy that `list` records writes host subresource
+/// `host_subresource` of `resource` alone (textures of different mip drops):
+/// from the submission that runs `list` on, that subresource keeps the
+/// host's contents and the others still take title memory's (as
+/// [`host_writes`]).
+pub(crate) fn host_writes_subresource(list: &HostList, resource: This, host_subresource: u32) {
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        list.defer_host(move || {
+            copy.host_written_subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(Default::default)
+                .insert(host_subresource);
+        });
     }
 }
 
@@ -389,6 +410,16 @@ pub(crate) fn record_upload(
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    // Subresources a partial host copy wrote keep the host's contents.
+    let written = copy.host_written_subs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let kept;
+    let subresources: &[u32] = match &written {
+        Some(w) => {
+            kept = subresources.iter().copied().filter(|s| !w.contains(s)).collect::<Vec<_>>();
+            &kept
+        }
+        None => subresources,
+    };
     if let Some(b) = list.move_texture(copy, COPY_DEST) {
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
@@ -685,7 +716,7 @@ impl Staging {
         }
         for &i in subresources {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
-            let (mip, slice) = (i % self.mips, i / self.mips);
+            let (mip, slice) = (i % self.mips + self.mip_drop, i / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -823,13 +854,15 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let mip_drop = crate::resource::host_mip_drop(resource);
+    let spans = spans(&layout, count, u32::from(d.MipLevels), mip_drop);
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,

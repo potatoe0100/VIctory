@@ -141,6 +141,20 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+impl Host {
+    /// Dedicated VRAM reported by the host D3D12 device's DXGI adapter, in bytes.
+    pub(crate) fn dedicated_video_memory(&self) -> Option<u64> {
+        // SAFETY: plain DXGI query for the live device's adapter LUID.
+        unsafe {
+            let luid = self.device.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            Some(desc.DedicatedVideoMemory as u64)
+        }
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {

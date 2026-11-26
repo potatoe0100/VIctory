@@ -1462,6 +1462,132 @@ pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
     make(view, at).flatten().map(|k| k.0)
 }
 
+/// Re-bases a console SRV mip window onto a host texture whose top `drop`
+/// mips were omitted (`host_mips` surviving levels, representing console levels
+/// `drop..drop + host_mips`).
+fn rebase_mip_window(
+    most_detailed: u32,
+    mip_levels: u32,
+    min_lod: f32,
+    drop: u32,
+    host_mips: u32,
+) -> (u32, u32, f32) {
+    if drop == 0 {
+        return (most_detailed, mip_levels, min_lod);
+    }
+    let host_mips = host_mips.max(1);
+    let title_mips = host_mips.saturating_add(drop);
+    let new_min_lod = (min_lod - drop as f32).max(0.0);
+    if mip_levels == u32::MAX {
+        let new_start = most_detailed.saturating_sub(drop).min(host_mips - 1);
+        return (new_start, u32::MAX, new_min_lod);
+    }
+    let guest_end = most_detailed.saturating_add(mip_levels);
+    let retained_start = most_detailed.max(drop);
+    let retained_end = guest_end.min(title_mips);
+    if retained_start < retained_end {
+        (
+            retained_start - drop,
+            retained_end - retained_start,
+            new_min_lod,
+        )
+    } else {
+        // The view named only dropped top mips (or past the chain): bind the
+        // highest surviving host mip so the descriptor stays valid.
+        let new_start = if most_detailed < drop {
+            0
+        } else {
+            host_mips - 1
+        };
+        (new_start, 1, new_min_lod)
+    }
+}
+
+/// Adjusts an explicit SRV description for a texture whose top `drop` mips
+/// were omitted on the host.
+fn adjust_srv_for_mip_drop(srv: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, drop: u32, host_mips: u32) {
+    if drop == 0 {
+        return;
+    }
+    // SAFETY: each branch reads and writes only the union arm named by
+    // `srv.ViewDimension`.
+    unsafe {
+        match srv.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE1D => {
+                let t = &mut srv.Anonymous.Texture1D;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let t = &mut srv.Anonymous.Texture1DArray;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut srv.Anonymous.Texture2D;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut srv.Anonymous.Texture2DArray;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE3D => {
+                let t = &mut srv.Anonymous.Texture3D;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut srv.Anonymous.TextureCube;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut srv.Anonymous.TextureCubeArray;
+                (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp) = rebase_mip_window(
+                    t.MostDetailedMip,
+                    t.MipLevels,
+                    t.ResourceMinLODClamp,
+                    drop,
+                    host_mips,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1507,6 +1633,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                let (drop, host_mips) = crate::resource::host_mip_info(resource);
+                if drop > 0
+                    && let Some(srv) = desc.as_mut()
+                {
+                    adjust_srv_for_mip_drop(srv, drop, host_mips);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -2461,5 +2593,64 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn srv_mip_window_rebasing_handles_partial_full_and_dropped_ranges() {
+        // 7 guest mips, drop 2 => 5 host mips representing guest {2,3,4,5,6}.
+        // Guest view {1,2,3} retains only guest {2,3} => host {0,1} (2 levels).
+        assert_eq!(rebase_mip_window(1, 3, 3.5, 2, 5), (0, 2, 1.5));
+        // Guest view entirely within retained mips: {3,4} => host {1,2}.
+        assert_eq!(rebase_mip_window(3, 2, 1.0, 2, 5), (1, 2, 0.0));
+        // Full-chain sentinel keeps u32::MAX.
+        assert_eq!(
+            rebase_mip_window(0, u32::MAX, 0.0, 2, 5),
+            (0, u32::MAX, 0.0)
+        );
+        assert_eq!(
+            rebase_mip_window(4, u32::MAX, 2.5, 2, 5),
+            (2, u32::MAX, 0.5)
+        );
+        // Guest view naming only dropped top mips clamps to highest surviving host mip 0.
+        assert_eq!(rebase_mip_window(0, 1, 0.0, 2, 5), (0, 1, 0.0));
+        assert_eq!(rebase_mip_window(0, 2, 0.0, 2, 5), (0, 1, 0.0));
+        // Zero drop is an exact no-op.
+        assert_eq!(rebase_mip_window(1, 3, 1.5, 0, 7), (1, 3, 1.5));
+
+        // Check union dispatch across representative SRV dimensions.
+        let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 1,
+                    MipLevels: 3,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 2.5,
+                },
+            },
+            ..Default::default()
+        };
+        adjust_srv_for_mip_drop(&mut srv2d, 2, 5);
+        // SAFETY: `ViewDimension` is `TEXTURE2D`.
+        let t2 = unsafe { srv2d.Anonymous.Texture2D };
+        assert_eq!((t2.MostDetailedMip, t2.MipLevels), (0, 2));
+        assert_eq!(t2.ResourceMinLODClamp, 0.5);
+
+        let mut cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 4,
+                    ResourceMinLODClamp: 1.0,
+                },
+            },
+            ..Default::default()
+        };
+        adjust_srv_for_mip_drop(&mut cube, 1, 6);
+        // SAFETY: `ViewDimension` is `TEXTURECUBE`.
+        let tc = unsafe { cube.Anonymous.TextureCube };
+        assert_eq!((tc.MostDetailedMip, tc.MipLevels), (0, 3));
+        assert_eq!(tc.ResourceMinLODClamp, 0.0);
     }
 }
