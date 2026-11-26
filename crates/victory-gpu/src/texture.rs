@@ -1377,7 +1377,14 @@ impl Staging {
                 }
             }
         }
-        held
+        crate::tiles::cap_levels(
+            held,
+            u64::from(self.layout.desc.width),
+            self.layout.desc.height,
+            mips.len(),
+            tail,
+            crate::tiles::max_dim(),
+        )
     }
 
     /// Forgets what the staging buffer was last filled from: the next

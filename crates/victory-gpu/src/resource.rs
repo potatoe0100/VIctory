@@ -1729,7 +1729,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        let all = crate::tiles::all();
+        if shape_fits
+            && r.host.placed.load(Relaxed)
+            && crate::tiles::wanted()
+            && (!all || alias_of(this).is_none())
+        {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1737,7 +1742,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
             let partly = readable
                 && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                && (all
+                    || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };

@@ -99,10 +99,72 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
+            all = all(),
+            max_dim = max_dim(),
             "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
         );
         on
     })
+}
+
+/// `VICTORY_LEVELS_ALL=1`: any large 2D single-layer mipmapped texture the
+/// title fills may use reserved levels-on-demand allocation, even when all
+/// its guest pages are already committed (off by default).
+pub(crate) fn all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEVELS_ALL").is_some_and(|v| v == "1"))
+}
+
+fn parse_max_dim(value: Option<&str>) -> Option<u32> {
+    let dim = value.and_then(|v| v.trim().parse::<u32>().ok())?;
+    (dim > 0).then(|| dim.max(64))
+}
+
+/// `VICTORY_LEVELS_MAX_DIM=<pixels>`: drops mip levels whose larger side
+/// exceeds `<pixels>` from on-demand tile allocation and staging detiling
+/// (minimum 64 px; unset or 0: off).
+pub(crate) fn max_dim() -> Option<u32> {
+    static MAX: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| parse_max_dim(std::env::var("VICTORY_LEVELS_MAX_DIM").ok().as_deref()))
+}
+
+/// Filters held mip bitmask `held` to levels with `max(w >> mip, h >> mip)
+/// <= max_dim`, always retaining held levels at or above `first_tail` (or
+/// the highest held mip when `held != 0` and none matched) so a held
+/// texture never ends up empty.
+pub(crate) fn cap_levels(
+    held: u32,
+    width: u64,
+    height: u32,
+    mips: usize,
+    first_tail: usize,
+    max_dim: Option<u32>,
+) -> u32 {
+    let Some(limit) = max_dim else {
+        return held;
+    };
+    if held == 0 || mips == 0 {
+        return held;
+    }
+    let count = mips.min(32);
+    let limit = u64::from(limit);
+    let mut kept = 0u32;
+    for mip in 0..count {
+        let bit = 1u32 << mip;
+        if held & bit == 0 {
+            continue;
+        }
+        let mw = (width >> mip).max(1);
+        let mh = (u64::from(height) >> mip).max(1);
+        if mip >= first_tail || (mw <= limit && mh <= limit) {
+            kept |= bit;
+        }
+    }
+    if kept == 0 {
+        let highest = 31 - held.leading_zeros();
+        kept = 1u32 << highest;
+    }
+    kept
 }
 
 fn parse_floor(value: Option<&str>) -> u64 {
@@ -1583,5 +1645,34 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn max_dim_parses_and_floors_at_64() {
+        assert_eq!(parse_max_dim(None), None);
+        assert_eq!(parse_max_dim(Some("")), None);
+        assert_eq!(parse_max_dim(Some("0")), None);
+        assert_eq!(parse_max_dim(Some("nope")), None);
+        assert_eq!(parse_max_dim(Some("16")), Some(64));
+        assert_eq!(parse_max_dim(Some(" 1024 ")), Some(1024));
+    }
+
+    #[test]
+    fn cap_levels_drops_oversized_mips_but_keeps_tail_and_fallback() {
+        let full = |n: usize| -> u32 { (1u32 << n) - 1 };
+        // Off: keeps all bits untouched.
+        assert_eq!(cap_levels(full(13), 4096, 4096, 13, 9, None), full(13));
+        // 4096x4096 with 1024 cap drops mips 0 (4096) and 1 (2048).
+        assert_eq!(cap_levels(full(13), 4096, 4096, 13, 9, Some(1024)), full(13) & !0b11);
+        // Non-square 2048x1024 with 1024 cap drops only mip 0 (max(2048, 1024) > 1024).
+        assert_eq!(cap_levels(full(12), 2048, 1024, 12, 8, Some(1024)), full(12) & !0b1);
+        // Texture already within cap stays unchanged.
+        assert_eq!(cap_levels(full(10), 512, 512, 10, 6, Some(1024)), full(10));
+        // Single-mip oversized held texture falls back cleanly instead of becoming 0.
+        assert_eq!(cap_levels(1 << 0, 2048, 2048, 2, 1, Some(1024)), 1 << 0);
+        // Packed tail is always preserved even if held alone.
+        assert_eq!(cap_levels(0b11 << 8, 4096, 4096, 10, 8, Some(64)), 0b11 << 8);
+        // Unheld stays 0.
+        assert_eq!(cap_levels(0, 4096, 4096, 13, 9, Some(1024)), 0);
     }
 }
