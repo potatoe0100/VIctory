@@ -37,3 +37,16 @@ Rule for adding anything: it must fix or prevent something specific on an 8 GB N
 | Build | Passed | Failed | Ignored |
 | --- | --- | --- | --- |
 | VIctory-NVIDIA 7480e96 (base) | 927 | 0 | 45 |
+| nvidia-4060 (with the crash-report fix) | 931 | 0 | 45 |
+
+Also on the 4060:
+- `levels_on_demand_on_the_card` (ignored by default; `VICTORY_TILES_TEST_CARD=1`, release): all steps passed on the
+  card, tiled resources tier 4, debug layer on. So `VICTORY_LEVELS_ON_DEMAND=1` is safe to try on this card.
+- `the_8gb_launcher_settings_fit_the_reported_budget`: budget 7,188 MiB with the desktop running; card buffers 768 +
+  render targets 3,072 + texture floor 1,797 = 5,637 MiB, under the 90% line of 6,469 MiB.
+
+## Also left out
+
+| Branch | Why |
+| --- | --- |
+| `nvidia-xtx-ports` (zero-copy renderer ports 5-7) | Brings in avatarmanz/VIctory-7900XTX up to c9c932c, which merges code from codec-d/cool_fox (commit a12870a), a CGBJ-derived source this branch does not use. The ports are off by default and save CPU copy time, not video memory. |
