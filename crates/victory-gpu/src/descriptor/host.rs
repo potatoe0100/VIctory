@@ -408,7 +408,11 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        let holds = matches!(kept, Some(Some(_)));
         self.keep(index, kept.flatten());
+        if holds {
+            self.check_resident(index, view);
+        }
         self.set_stride(index, Some(view));
         self.set_mark(index, mark);
         // A table made afresh: shaders reading a view's address there (e.g.
@@ -827,7 +831,11 @@ impl HostHeap {
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
+            let holds = matches!(kept, Some(Some(_)));
             self.keep(index, kept.flatten());
+            if holds {
+                self.check_resident(index, &view);
+            }
         }
         Some(view)
     }
@@ -854,7 +862,7 @@ impl HostHeap {
     }
 
     /// Slots viewing one of the host textures `textures` (raw pointers),
-    /// which are given up: each gets a null view of its kind and holds the
+    /// which are given up or evicted: each gets a null view of its kind and holds the
     /// texture no more (retired until the running submission has run), its
     /// record stays noted so heap syncs leave it, and the next draw reading
     /// it through a table or shader reading it through the heap (its read
@@ -888,6 +896,35 @@ impl HostHeap {
                 self.viewed.set(index, view.as_ref(), false);
                 crate::shadow::forget_read(index);
             }
+        }
+    }
+
+    /// Slot `index` was just made from `view` and holds what it views. Its
+    /// use made a texture evicted past the budget resident first
+    /// (`crate::residency`), but a pass may have picked or evicted it since:
+    /// a slot that held it before the pass's walk of the heaps
+    /// ([`Self::evict`]) was left null by it, and one that holds it after
+    /// sees the pick here. The texture is made resident, or the slot left
+    /// null (made again when read) if it cannot be.
+    fn check_resident(&self, index: u32, view: &View) {
+        if crate::residency::all_resident() {
+            return;
+        }
+        let placed = placed_texture(view);
+        let (View::Shader(r, _) | View::Unordered(r, ..)) = placed.as_ref().unwrap_or(view) else {
+            return;
+        };
+        let Some(texture) = crate::resource::made_copy(*r as crate::object::This) else {
+            return;
+        };
+        if crate::residency::make_resident(&texture) {
+            return;
+        }
+        null_for(view, self.cpu(index));
+        self.keep(index, None);
+        if index < self.count {
+            self.viewed.set(index, Some(view), false);
+            crate::shadow::forget_read(index);
         }
     }
 
