@@ -39,6 +39,24 @@ bodies, slower); `-NoSmoothMotion`. If video memory runs out, try
 `-More @{VICTORY_LEVELS_ON_DEMAND='1'}`: textures take memory only for the levels the game holds. Its test passes on
 an RTX 4060, but it hasn't been tried in the game on this branch.
 
+## Keyboard and mouse
+
+The game reads a controller. With none connected, `play-4060.ps1` sets `VICTORY_KBM_GTA=1` (upstream pull request
+3345): a GTA V PC-style layout on the stand-in pad. Press `F2` or `` ` `` to lock mouse look (the pointer hides and
+stays in the window); `Esc`, `P` or switching windows lets it go. `VICTORY_MOUSE_SENS` scales the camera speed
+(default 1.0), `VICTORY_MOUSE_INVERT_Y=1` inverts it. `Ctrl+Shift+Q` ends the game (it has no quit option of its own).
+
+| Keys / mouse | Pad |
+| --- | --- |
+| W A S D | left stick (move, steer) |
+| mouse (locked) or I J K L | right stick (camera, aim) |
+| left / right click | RT (shoot, gas) / LT (aim, brake) |
+| Shift or Enter, R or Backspace, Space, F | A (sprint, confirm), B (reload, back), X (jump), Y (vehicle) |
+| Tab / Q | LB (weapon wheel) / RB (cover, handbrake) |
+| Ctrl, C or middle click or Caps Lock | L3 (crouch, horn), R3 (look behind) |
+| E or Right, Up or M, Down or Z, Left or G | D-pad |
+| Esc or P, V | Menu (pause), View (camera) |
+
 ## Reporting how it runs
 
 Every 5 seconds the console window prints a line like `20.5 fps, 48.8 ms/frame (...)`. Please note:

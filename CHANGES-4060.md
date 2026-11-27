@@ -20,6 +20,8 @@ Rule for adding anything: it must fix or prevent something specific on an 8 GB N
 | TextureQueue recheck fix (from Voltexs 753fa59, that hunk only) | Voltexs/VIctory-RTXNvidia | Stops about 2,000 needless 48 KiB texture re-hashes a second |
 | Presets safe / balanced / fast | this branch | 480p 512 MB + levels on demand / 540p 1,024 MB / 540p 1,536 MB, each checked against the card's budget and 1 GB less |
 | `scripts/sync-4060.ps1` | this branch | Follows VIctory-NVIDIA and lists new upstream GPU commits to port |
+| Keyboard and mouse layout (`VICTORY_KBM_GTA`, set by play-4060.ps1) | Marvisak/VIctory pull request 3345, hand-merged beside the base's mouse device | First run: mouse look and clicks did nothing (the game reads the pad); now the mouse drives the stand-in pad's right stick and triggers |
+| Quit key Ctrl+Shift+Q | this branch | A console game has no quit option; ends it the way the close button does |
 
 ## Already in the base (not merged again)
 

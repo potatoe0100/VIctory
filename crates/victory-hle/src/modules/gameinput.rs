@@ -82,6 +82,175 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
+// Ported from Marvisak/VIctory pull request 3345 (VICTORY_KBM_GTA), hand-merged
+// beside this fork's mouse device and one-pad mode.
+
+/// Opt-in GTA V PC-style keyboard bindings for the stand-in gamepad
+/// (`VICTORY_KBM_GTA=1`). Left stick stays W/A/S/D; right stick is driven by
+/// mouse look (toggled with F2 or `` ` `` / `~`) plus I/J/K/L fallback;
+/// triggers come from LMB (RT) and RMB (LT). `Host::keys()` reports specific
+/// left/right modifiers (`0xA0..=0xA5`) rather than generic `0x10..=0x12`.
+const GTA_BUTTONS: [(u8, u32); 26] = [
+    (0x1B, MENU),           // Esc (also unlocks mouse look)
+    (b'P', MENU),           // Pause / Map
+    (b'V', VIEW),           // Change camera perspective
+    (0xA0, A),              // Left Shift: Sprint
+    (0xA1, A),              // Right Shift: Sprint
+    (0x0D, A),              // Enter: Confirm (menus)
+    (0x20, X),              // Space: Jump / Climb / Vault
+    (b'X', X),              // X fallback
+    (b'R', B),              // Reload / Melee
+    (0x08, B),              // Backspace: Back / Cancel (menus)
+    (b'F', Y),              // Enter / Exit vehicle
+    (0x09, LEFT_SHOULDER),  // Tab: Weapon wheel (LB)
+    (b'Q', RIGHT_SHOULDER), // Q: Take cover / Handbrake (RB)
+    (0xA2, LEFT_STICK),     // Left Ctrl: Crouch / Stealth / Horn (L3)
+    (0xA3, LEFT_STICK),     // Right Ctrl: Crouch / Stealth / Horn (L3)
+    (b'C', RIGHT_STICK),    // C: Look behind / Special (R3)
+    (0x14, RIGHT_STICK),    // Caps Lock: Special (R3)
+    (b'H', RIGHT_STICK),    // H fallback (R3)
+    (b'E', RIGHT),          // E: Interact / Talk (D-pad Right)
+    (0x27, RIGHT),          // Right arrow (D-pad Right)
+    (0x26, UP),             // Up arrow: Phone (D-pad Up)
+    (b'M', UP),             // M: Phone / Menu (D-pad Up)
+    (0x28, DOWN),           // Down arrow: Character wheel / Minimap (D-pad Down)
+    (b'Z', DOWN),           // Z: Expand minimap / Character wheel (D-pad Down)
+    (0x25, LEFT),           // Left arrow (D-pad Left)
+    (b'G', LEFT),           // G: Throw / Context left (D-pad Left)
+];
+
+/// Whether GTA mouse-look lock (`~` / `F2`) is currently active; read by
+/// `lifecycle` on `WM_SETCURSOR` to auto-hide the Windows cursor inside the
+/// game window's client area while locked.
+#[cfg(windows)]
+static CURSOR_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Returns true while GTA mouse-look lock (`~` / `F2`) is active and the
+/// cursor should be hidden inside the client area.
+#[cfg(windows)]
+pub(crate) fn cursor_locked() -> bool {
+    CURSOR_LOCKED.load(Ordering::Relaxed)
+}
+
+/// Parses an opt-in boolean environment variable (`1`, `true`, `yes`, `on`,
+/// ignoring surrounding whitespace and ASCII case).
+fn parse_env_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// GTA V PC-style keyboard + mouse stand-in pad (`VICTORY_KBM_GTA=1`).
+/// Off by default so the existing keyboard table and tests stay unchanged.
+fn gta_kbm() -> bool {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_KBM_GTA").is_ok_and(|v| parse_env_flag(&v)));
+    *ENABLED
+}
+
+/// Mouse-look sensitivity multiplier for `VICTORY_KBM_GTA=1`
+/// (`VICTORY_MOUSE_SENS`, default `1.0`).
+#[cfg(windows)]
+fn mouse_sens() -> f32 {
+    static SENS: LazyLock<f32> = LazyLock::new(|| {
+        std::env::var("VICTORY_MOUSE_SENS")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    });
+    *SENS
+}
+
+/// Invert mouse Y axis for `VICTORY_KBM_GTA=1` (`VICTORY_MOUSE_INVERT_Y=1`).
+#[cfg(windows)]
+fn mouse_invert_y() -> bool {
+    static INVERT: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_MOUSE_INVERT_Y").is_ok_and(|v| parse_env_flag(&v)));
+    *INVERT
+}
+
+/// Exponentially smoothed mouse-delta to right-stick velocity converter.
+///
+/// The poll loop runs at 125 Hz (8 ms) while 3D gameplay may render at low
+/// framerates (~5 FPS). A 45 ms half-life keeps flicks alive long enough for
+/// the next rendered frame to sample them while settling cleanly to zero.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct MouseLook {
+    vx: f32,
+    vy: f32,
+}
+
+#[cfg(any(windows, test))]
+impl MouseLook {
+    const BASE_SENS: f32 = 0.022;
+    const HALF_LIFE_SECS: f32 = 0.045;
+    const DEADZONE: f32 = 0.015;
+
+    fn reset(&mut self) {
+        self.vx = 0.0;
+        self.vy = 0.0;
+    }
+
+    fn step(&mut self, dx: i32, dy: i32, dt: Duration, sens: f32, invert_y: bool) -> (f32, f32) {
+        let dt_secs = dt.as_secs_f32().clamp(0.001, 0.25);
+        let decay = 0.5_f32.powf(dt_secs / Self::HALF_LIFE_SECS);
+        let scale = Self::BASE_SENS * sens;
+        let y_sign = if invert_y { 1.0 } else { -1.0 };
+        self.vx = (self.vx * decay + dx as f32 * scale).clamp(-1.0, 1.0);
+        self.vy = (self.vy * decay + dy as f32 * scale * y_sign).clamp(-1.0, 1.0);
+        // Only snap tiny residual decay to zero at rest so low-sensitivity
+        // 1-pixel movements are never dropped.
+        if dx == 0 && self.vx.abs() < Self::DEADZONE {
+            self.vx = 0.0;
+        }
+        if dy == 0 && self.vy.abs() < Self::DEADZONE {
+            self.vy = 0.0;
+        }
+        (self.vx, self.vy)
+    }
+}
+
+/// Edge-captured state for `[LMB, RMB, MMB]` so holding a button on window
+/// chrome or in another app and dragging into the client area never fires
+/// triggers or buttons.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct MouseButtons {
+    seeded: bool,
+    prev: [bool; 3],
+    captured: [bool; 3],
+}
+
+#[cfg(any(windows, test))]
+impl MouseButtons {
+    fn reset(&mut self) {
+        self.seeded = false;
+        self.prev = [false; 3];
+        self.captured = [false; 3];
+    }
+
+    fn update(&mut self, down: [bool; 3], eligible: bool) -> [bool; 3] {
+        if !self.seeded {
+            self.seeded = true;
+            self.prev = down;
+            self.captured = [false; 3];
+            return self.captured;
+        }
+        for ((&is_down, prev), captured) in down.iter().zip(&mut self.prev).zip(&mut self.captured) {
+            if !is_down {
+                *captured = false;
+            } else if !*prev && eligible {
+                *captured = true;
+            }
+            *prev = is_down;
+        }
+        self.captured
+    }
+}
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -149,9 +318,19 @@ trait Source: Send {
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Extra stand-in pad input from the mouse when `VICTORY_KBM_GTA=1`.
+    /// When `active` is false (a physical controller owns input), any active
+    /// mouse-look capture must be released without warping the cursor.
+    fn mouse_pad(&mut self, _active: bool) -> PadState {
+        PadState::default()
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
+    fallback_for(keys, gta_kbm())
+}
+
+fn fallback_for(keys: &[KeyState], gta: bool) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -159,13 +338,14 @@ fn fallback(keys: &[KeyState]) -> PadState {
             0.0
         }
     };
+    let table: &[(u8, u32)] = if gta { &GTA_BUTTONS } else { &FALLBACK_BUTTONS };
     PadState {
-        buttons: FALLBACK_BUTTONS
+        buttons: table
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        left_trigger: if gta { 0.0 } else { on(b'Z') },
+        right_trigger: if gta { 0.0 } else { on(b'C') },
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
@@ -468,14 +648,18 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, mouse) = {
+        let (pads, keys, mouse, look) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys(), source.mouse())
+            let (keys, mouse) = (source.keys(), source.mouse());
+            // The mouse drives the stand-in pad only while no host pad is
+            // there (VICTORY_KBM_GTA, pull request 3345).
+            let look = source.mouse_pad(pads.iter().all(Option::is_none));
+            (pads, keys, mouse, look)
         };
         let events = self
             .state()
-            .poll(&self.devices, self.one_pad, pads, keys, mouse);
+            .poll(&self.devices, self.one_pad, pads, keys, mouse, look);
         self.deliver(events);
     }
 
@@ -522,12 +706,14 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: Option<MouseState>,
+        look: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        let stand_in = |keys: &[KeyState]| merged(fallback(keys), look);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in(&keys), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -536,7 +722,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(stand_in(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1178,7 +1364,7 @@ mod host {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
-    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
@@ -1192,7 +1378,8 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+        GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId, HTCLIENT,
+        PostMessageW, SetCursorPos, WM_MOUSEMOVE, WM_SETCURSOR,
     };
 
     use super::*;
@@ -1239,6 +1426,45 @@ mod host {
         empty_until: [Option<Instant>; PADS],
         previous_cursor: Option<(i32, i32)>,
         mouse: MouseState,
+        mouse_locked: bool,
+        just_locked: bool,
+        toggle_was_down: bool,
+        anchor: (i32, i32),
+        mouse_last_poll: Option<Instant>,
+        mouse_look: MouseLook,
+        mouse_buttons: MouseButtons,
+    }
+
+    impl Host {
+        fn set_mouse_locked(&mut self, locked: bool, hwnd: Option<HWND>) {
+            if self.mouse_locked == locked {
+                return;
+            }
+            self.mouse_locked = locked;
+            CURSOR_LOCKED.store(locked, Ordering::Release);
+            if let Some(hwnd) = hwnd {
+                // Prompt the window's UI thread to run WM_SETCURSOR right away
+                // so the cursor hides/reappears the instant `~`/`F2`/`Esc`/`P`
+                // is pressed, even before moving the mouse.
+                let lparam = (HTCLIENT as isize) | ((WM_MOUSEMOVE as isize) << 16);
+                // SAFETY: asynchronous post to our own process's foreground window.
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_SETCURSOR, hwnd as usize, lparam);
+                }
+            }
+        }
+
+        fn disarm_mouse(&mut self, hwnd: Option<HWND>, reason: &'static str) {
+            if self.mouse_locked {
+                self.set_mouse_locked(false, hwnd);
+                tracing::info!(reason, "mouse look unlocked");
+            }
+            self.just_locked = false;
+            self.mouse_look.reset();
+            self.mouse_last_poll = None;
+            self.toggle_was_down = false;
+            self.mouse_buttons.reset();
+        }
     }
 
     impl Source for Host {
@@ -1321,8 +1547,15 @@ mod host {
                 self.mouse = MouseState::default();
                 return None;
             }
-            self.mouse.position_x += dx;
-            self.mouse.position_y += dy;
+            // While mouse look holds the cursor in the window's middle its
+            // warps are not motion: the device's position stands still, and
+            // motion starts afresh once it lets go.
+            if self.mouse_locked {
+                self.previous_cursor = None;
+            } else {
+                self.mouse.position_x += dx;
+                self.mouse.position_y += dy;
+            }
             self.mouse.buttons = 0;
             for (bit, vk) in [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].into_iter().enumerate() {
                 // SAFETY: virtual-key state query.
@@ -1341,6 +1574,164 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+
+        fn mouse_pad(&mut self, active: bool) -> PadState {
+            if !gta_kbm() || !active {
+                self.disarm_mouse(focused_window(), "stand-in inactive");
+                return PadState::default();
+            }
+            let Some(hwnd) = focused_window() else {
+                self.disarm_mouse(None, "focus lost");
+                return PadState::default();
+            };
+
+            let key_down = |vk: i32| {
+                // SAFETY: plain async key state query.
+                unsafe { GetAsyncKeyState(vk) < 0 }
+            };
+
+            // Toggle mouse-look lock with F2 (0x71, layout-independent) or
+            // VK_OEM_3 (0xC0, `` ` `` / `~` on US layouts).
+            let toggle_down = key_down(0x71) || key_down(0xC0);
+            if toggle_down && !self.toggle_was_down {
+                let next = !self.mouse_locked;
+                self.set_mouse_locked(next, Some(hwnd));
+                self.just_locked = next;
+                self.mouse_look.reset();
+                tracing::info!(locked = next, "mouse look toggled");
+            }
+            self.toggle_was_down = toggle_down;
+
+            // Esc (0x1B) or P opens the pause menu and frees the mouse so the
+            // user is never trapped in mouse-look mode.
+            if self.mouse_locked && (key_down(0x1B) || key_down(i32::from(b'P'))) {
+                self.set_mouse_locked(false, Some(hwnd));
+                self.just_locked = false;
+                self.mouse_look.reset();
+                tracing::info!("mouse look unlocked (menu key)");
+            }
+
+            let Some((c_left, c_top, c_right, c_bottom)) = client_rect_screen(hwnd) else {
+                self.disarm_mouse(Some(hwnd), "client unavailable");
+                return PadState::default();
+            };
+            let mut pos = POINT::default();
+            // SAFETY: valid pointer to our initialized POINT.
+            if unsafe { GetCursorPos(&mut pos) } == 0 {
+                self.disarm_mouse(Some(hwnd), "cursor query failed");
+                return PadState::default();
+            }
+
+            let now = Instant::now();
+            let dt = self
+                .mouse_last_poll
+                .replace(now)
+                .map_or(POLL, |prev| now.saturating_duration_since(prev));
+
+            let (right_x, right_y) = if self.mouse_locked {
+                let cx = c_left + (c_right - c_left) / 2;
+                let cy = c_top + (c_bottom - c_top) / 2;
+                let (dx, dy) = if self.just_locked {
+                    self.just_locked = false;
+                    if let Some(anchor) = recenter_cursor(cx, cy) {
+                        self.anchor = anchor;
+                    } else {
+                        self.set_mouse_locked(false, Some(hwnd));
+                        self.mouse_look.reset();
+                        tracing::warn!("mouse look unlocked (cursor warp failed)");
+                    }
+                    (0, 0)
+                } else {
+                    let dx = pos.x - self.anchor.0;
+                    let dy = pos.y - self.anchor.1;
+                    if dx != 0 || dy != 0 {
+                        if let Some(anchor) = recenter_cursor(cx, cy) {
+                            self.anchor = anchor;
+                            (dx, dy)
+                        } else {
+                            self.set_mouse_locked(false, Some(hwnd));
+                            self.mouse_look.reset();
+                            tracing::warn!("mouse look unlocked (cursor warp failed)");
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    }
+                };
+                if self.mouse_locked {
+                    self.mouse_look
+                        .step(dx, dy, dt, mouse_sens(), mouse_invert_y())
+                } else {
+                    (0.0, 0.0)
+                }
+            } else {
+                self.mouse_look.reset();
+                (0.0, 0.0)
+            };
+
+            let in_client =
+                (c_left..c_right).contains(&pos.x) && (c_top..c_bottom).contains(&pos.y);
+            let [lmb, rmb, mmb] = self.mouse_buttons.update(
+                [key_down(0x01), key_down(0x02), key_down(0x04)],
+                self.mouse_locked || in_client,
+            );
+            let mut pad = PadState {
+                right_x,
+                right_y,
+                ..Default::default()
+            };
+            if lmb {
+                pad.right_trigger = 1.0; // LMB: Shoot / Attack / Gas (RT)
+            }
+            if rmb {
+                pad.left_trigger = 1.0; // RMB: Aim / Brake-Reverse (LT)
+            }
+            if mmb {
+                pad.buttons |= RIGHT_STICK; // MMB: Look behind / Special (R3)
+            }
+            pad
+        }
+    }
+
+    /// Recenters the cursor at `(cx, cy)` and reads back its actual screen
+    /// position so fractional DPI scaling never introduces phantom drift.
+    /// Returns `None` if either Win32 call fails.
+    fn recenter_cursor(cx: i32, cy: i32) -> Option<(i32, i32)> {
+        // SAFETY: recenters the cursor inside our own foreground window.
+        if unsafe { SetCursorPos(cx, cy) } == 0 {
+            return None;
+        }
+        let mut settled = POINT::default();
+        // SAFETY: valid pointer to our initialized POINT.
+        if unsafe { GetCursorPos(&mut settled) } == 0 {
+            return None;
+        }
+        Some((settled.x, settled.y))
+    }
+
+    /// Client area in screen coordinates using `GetClientRect` + `ClientToScreen`.
+    fn client_rect_screen(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+        let mut cli = RECT::default();
+        // SAFETY: valid pointer to our stack RECT.
+        if unsafe { GetClientRect(hwnd, &mut cli) } == 0 {
+            return None;
+        }
+        if cli.right - cli.left < 64 || cli.bottom - cli.top < 64 {
+            return None;
+        }
+        let mut tl = POINT {
+            x: cli.left,
+            y: cli.top,
+        };
+        let mut br = POINT {
+            x: cli.right,
+            y: cli.bottom,
+        };
+        // SAFETY: valid pointers to our stack POINTs.
+        if unsafe { ClientToScreen(hwnd, &mut tl) == 0 || ClientToScreen(hwnd, &mut br) == 0 } {
+            return None;
+        }
+        Some((tl.x, tl.y, br.x, br.y))
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
@@ -1434,6 +1825,8 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         mouse: Option<MouseState>,
+        look: PadState,
+        look_active_log: Vec<bool>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1451,6 +1844,11 @@ mod tests {
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
+        }
+        fn mouse_pad(&mut self, active: bool) -> PadState {
+            let mut host = self.0.lock().unwrap();
+            host.look_active_log.push(active);
+            if active { host.look } else { PadState::default() }
         }
     }
 
@@ -1859,5 +2257,150 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn gta_kbm_maps_pc_style_keys_and_smooths_mouse_look() {
+        let keys = vec![
+            key(b'W'),
+            key(0xA0), // Left Shift -> A (Sprint)
+            key(0x20), // Space -> X (Jump)
+            key(b'R'), // R -> B (Reload)
+            key(b'F'), // F -> Y (Enter/Exit vehicle)
+            key(0x09), // Tab -> LB (Weapon wheel)
+            key(b'Q'), // Q -> RB (Cover)
+            key(0xA2), // Left Ctrl -> L3 (Crouch)
+            key(b'C'), // C -> R3 (Look behind), not RT
+            key(b'E'), // E -> D-pad Right (Interact)
+            key(b'Z'), // Z -> D-pad Down (Minimap), not LT
+            key(b'V'), // V -> View (Camera)
+            key(0x1B), // Esc -> Menu
+        ];
+        let mapped = fallback_for(&keys, true);
+        assert_eq!(
+            mapped.buttons,
+            A | X
+                | B
+                | Y
+                | LEFT_SHOULDER
+                | RIGHT_SHOULDER
+                | LEFT_STICK
+                | RIGHT_STICK
+                | RIGHT
+                | DOWN
+                | VIEW
+                | MENU
+        );
+        assert_eq!(mapped.left_y, 1.0);
+        assert_eq!(mapped.left_trigger, 0.0);
+        assert_eq!(mapped.right_trigger, 0.0);
+        // The default table is unchanged.
+        let plain = fallback_for(&[key(b'Z'), key(b'C')], false);
+        assert_eq!((plain.left_trigger, plain.right_trigger), (1.0, 1.0));
+
+        // The mouse pad merges into the stand-in pad, in both pad modes.
+        for one_pad in [false, true] {
+            let (hub, host) = fake_with(one_pad);
+            {
+                let mut h = host.lock().unwrap();
+                h.keys = vec![key(b'W')];
+                h.look = PadState {
+                    buttons: RIGHT_STICK,
+                    left_trigger: 1.0,
+                    right_trigger: 1.0,
+                    right_x: 0.75,
+                    right_y: -0.25,
+                    ..Default::default()
+                };
+            }
+            hub.poll();
+            let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            let got = pad(r);
+            assert_eq!(got.buttons, RIGHT_STICK);
+            assert_eq!(
+                (
+                    got.left_y,
+                    got.left_trigger,
+                    got.right_trigger,
+                    got.right_x,
+                    got.right_y
+                ),
+                (1.0, 1.0, 1.0, 0.75, -0.25)
+            );
+            release(r);
+        }
+
+        let mut look = MouseLook::default();
+        let (rx, ry) = look.step(20, -10, POLL, 1.0, false);
+        assert!(
+            (0.3..=1.0).contains(&rx),
+            "mouse right should push +right_x, got {rx}"
+        );
+        assert!(
+            (0.15..=1.0).contains(&ry),
+            "mouse up (-dy) should push +right_y, got {ry}"
+        );
+        // Inverted Y flips the vertical axis.
+        look.reset();
+        let (_, ry_inv) = look.step(0, -10, POLL, 1.0, true);
+        assert!(ry_inv < -0.15, "invert_y should flip right_y, got {ry_inv}");
+        // Decays back to zero when the mouse stops moving.
+        for _ in 0..40 {
+            look.step(0, 0, POLL, 1.0, false);
+        }
+        assert_eq!(look.step(0, 0, POLL, 1.0, false), (0.0, 0.0));
+        // Low-sensitivity 1-pixel movement is not swallowed by the rest deadzone.
+        let (fine_x, _) = look.step(1, 0, POLL, 0.3, false);
+        assert!(
+            fine_x > 0.0,
+            "1px low-sens motion should stay non-zero, got {fine_x}"
+        );
+
+        // Strict boolean env parsing rejects "false", "0", " 0 ", and "".
+        assert!(parse_env_flag("1"));
+        assert!(parse_env_flag(" true "));
+        assert!(parse_env_flag("YES"));
+        assert!(!parse_env_flag("0"));
+        assert!(!parse_env_flag(" 0 "));
+        assert!(!parse_env_flag("false"));
+        assert!(!parse_env_flag(""));
+
+        // Dragging a held button from outside (chrome / another app) into the
+        // client area must not fire triggers until released and pressed fresh.
+        let mut buttons = MouseButtons::default();
+        assert_eq!(buttons.update([true, false, false], true), [false; 3]);
+        assert_eq!(buttons.update([true, false, false], true), [false; 3]);
+        assert_eq!(buttons.update([false, false, false], true), [false; 3]);
+        // Press outside client area, then drag inside: still ignored.
+        assert_eq!(buttons.update([true, false, false], false), [false; 3]);
+        assert_eq!(buttons.update([true, false, false], true), [false; 3]);
+        assert_eq!(buttons.update([false, false, false], true), [false; 3]);
+        // Fresh press inside client area captures and holds until release.
+        assert_eq!(
+            buttons.update([true, false, true], true),
+            [true, false, true]
+        );
+        assert_eq!(
+            buttons.update([true, false, true], false),
+            [true, false, true]
+        );
+        assert_eq!(buttons.update([false, false, false], false), [false; 3]);
+    }
+
+    #[test]
+    fn a_host_pad_takes_the_mouse_pad_away() {
+        for one_pad in [false, true] {
+            let (hub, host) = fake_with(one_pad);
+            assert_eq!(host.lock().unwrap().look_active_log.last(), Some(&true));
+            host.lock().unwrap().pads[0] = Some(PadState {
+                buttons: A,
+                ..Default::default()
+            });
+            hub.poll();
+            assert_eq!(host.lock().unwrap().look_active_log.last(), Some(&false));
+            host.lock().unwrap().pads[0] = None;
+            hub.poll();
+            assert_eq!(host.lock().unwrap().look_active_log.last(), Some(&true));
+        }
     }
 }
