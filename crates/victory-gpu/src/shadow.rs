@@ -2506,7 +2506,7 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
         }
         return merged.len();
     }
-    let mut runs = dword_runs(at, title, merged, 0);
+    let mut runs = word_runs(at, title, merged);
     if runs.len() > 64 {
         runs = dword_runs(at, title, merged, 32);
         PUT[3].fetch_add(1, Ordering::Relaxed);
@@ -4461,7 +4461,7 @@ impl Shadow {
                     vec![(0, n)]
                 } else {
                     crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
-                    dword_runs(at, held, title, 0)
+                    word_runs(at, held, title)
                 };
                 for &(a, len) in &runs {
                     if !whole {
