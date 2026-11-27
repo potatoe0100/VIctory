@@ -1996,6 +1996,14 @@ pub(crate) fn room_lately() -> bool {
 /// textures wait (runs 170-174); the card copies of title buffers from
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
+/// The card use textures are made up to: `budget` at [`room_percent`]
+/// (what [`room`] weighs against; for the sweeps' pressure, VIctory-NVIDIA
+/// PR #340).
+#[cfg(windows)]
+pub(crate) fn room_line(budget: u64) -> u64 {
+    budget / 100 * room_percent()
+}
+
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();

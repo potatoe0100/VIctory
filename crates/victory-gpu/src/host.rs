@@ -6087,7 +6087,7 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + self.sweep_every_ms() {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -9145,6 +9145,31 @@ struct Presenter {
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
+/// Logs how even the frames since the last line were: the median, the 95th
+/// and 99th percentile and the longest interval between presents, and how
+/// many took over 50 and over 100 ms (a frame rate of 30 with every frame
+/// at 33 ms plays smoothly; one with frames of 20 and 80 ms stutters).
+fn frame_times_line(intervals: &mut Vec<f32>) {
+    if intervals.is_empty() {
+        return;
+    }
+    intervals.sort_unstable_by(f32::total_cmp);
+    let at = |q: f32| intervals[((intervals.len() - 1) as f32 * q).round() as usize];
+    let over = |ms: f32| intervals.iter().filter(|&&t| t > ms).count();
+    tracing::info!(
+        target: "victory_gpu::frame_times",
+        "frame times: {} frames, median {:.1} ms, p95 {:.1}, p99 {:.1}, longest {:.1}; {} over 50 ms, {} over 100 ms",
+        intervals.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        intervals[intervals.len() - 1],
+        over(50.0),
+        over(100.0)
+    );
+    intervals.clear();
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -9152,6 +9177,10 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// The last present counted, and the intervals between presents since
+    /// the last frame-rate line, in ms: what the average hides (stutter).
+    last: std::time::Instant,
+    intervals: Vec<f32>,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -9166,6 +9195,8 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            last: now,
+            intervals: Vec::with_capacity(512),
             caption: None,
         }
     }
@@ -9187,10 +9218,14 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        let now = std::time::Instant::now();
+        self.intervals.push((now - self.last).as_secs_f32() * 1000.0);
+        self.last = now;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        frame_times_line(&mut self.intervals);
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
@@ -9730,6 +9765,47 @@ impl Host {
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
     /// not fit on the card).
+    /// How long between sweeps made behind flights ([`late_free_present`]).
+    /// Each settles everything in the air first, and that frame took 36 to
+    /// 82 ms instead of ~31 on an RTX 5070 Ti: at every 1.5 s, the 0.7
+    /// frames a second over 50 ms that made the prison stutter; without
+    /// sweeps, none. So while memory is not pressed they come every
+    /// `VICTORY_SWEEP_EVERY_MS` (15,000 by default; 1,500 as before), and
+    /// every 1.5 s while it is: the PC's memory under the residency
+    /// thresholds ([`crate::residency::pressured`]) or the card's use (less
+    /// the texture pool's free part) at the line textures are made up to
+    /// ([`crate::resource::room_line`]): textures are held back for room
+    /// then, and the sweep is what lets idle ones go (at 97% of the budget
+    /// instead, ~150,000 slots were held back a 5 s line for a minute of the
+    /// cutscene). Looked at twice a second.
+    fn sweep_every_ms(&self) -> u64 {
+        const PRESSED_MS: u64 = 1500;
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_SWEEP_EVERY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(15_000)
+        });
+        if every <= PRESSED_MS {
+            return every;
+        }
+        static LOOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let now = now_ms();
+        if now >= LOOKED.load(Ordering::Relaxed) + 500 {
+            LOOKED.store(now, Ordering::Relaxed);
+            crate::residency::refresh();
+            // The card past the line textures are made up to: textures are
+            // held back for room, and it is the sweep that lets idle ones go.
+            let card = self
+                .video_memory()
+                .is_none_or(|[budget, used, ..]| used.saturating_sub(crate::pool::texture_room()) >= crate::resource::room_line(budget));
+            let pressed = crate::residency::pressured() || card;
+            if PRESSED.swap(pressed, Ordering::Relaxed) != pressed {
+                tracing::info!(pressed, every_ms = if pressed { PRESSED_MS } else { every }, "sweeps behind flights");
+            }
+        }
+        if PRESSED.load(Ordering::Relaxed) { PRESSED_MS } else { every }
+    }
+
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
