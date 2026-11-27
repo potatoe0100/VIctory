@@ -511,6 +511,9 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
+    if let Some(shader) = p.shaders.iter().find(|shader| water_light_left_out(&shader.hash)) {
+        return Some(shader.hash.as_str());
+    }
     if hashes.is_empty() {
         return None;
     }
@@ -518,6 +521,23 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
+}
+
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`): programs of one 64-lane wave a group, which a host of 32-lane
+/// waves (NVIDIA) gets in the wave-wide form only. In that form they leave whole tiles of open
+/// water dark (around boats, along shores, under bridges) and take about 15 ms of the card a
+/// frame (trustno1-coder/VIctory-NVIDIA 35c1560, RTX 5070: 25 fps with them, 30 without).
+/// Left out there; the water is darker and bluer. `VICTORY_WATER_LIGHT=1` runs them.
+#[cfg(windows)]
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+#[cfg(windows)]
+fn water_light_left_out(hash: &str) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    WATER_LIGHT.contains(&hash)
+        && !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+        && victory_shader::emit::host_settings()[0] == 32
 }
 
 #[cfg(windows)]
