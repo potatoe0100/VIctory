@@ -53,6 +53,9 @@ pub(crate) struct IndexView {
 }
 
 /// Host states of a depth target, and of a texture shaders read.
+/// The sampler heap we bind when the title binds none (a value no title heap
+/// address takes).
+const SAMPLERS_OURS: usize = usize::MAX;
 const DEPTH_WRITE: u32 = 0x10;
 const DEPTH_READ: u32 = 0x20;
 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
@@ -1580,6 +1583,13 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
+    /// The heaps a list must have bound before one of our root signatures:
+    /// the title's view heap (if any), and its sampler heap or ours
+    /// ([`SAMPLERS_OURS`]) where it binds none.
+    fn wanted_heaps(title: [usize; 2]) -> [usize; 2] {
+        [title[0], if title[1] != 0 { title[1] } else { SAMPLERS_OURS }]
+    }
+
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
@@ -1598,18 +1608,28 @@ impl State {
         }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+        // Every root signature we make indexes its sampler heap directly, so a
+        // list must have one bound: ours where the title binds none (a compute
+        // list that only reads views; NVIDIA removes the device otherwise).
+        let want = Self::wanted_heaps(self.heaps);
+        if self.host_heaps != want {
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            if want[1] == SAMPLERS_OURS
+                && let Some(h) = crate::descriptor::fallback_samplers()
+            {
+                once!("the title binds no sampler heap: binding ours");
+                heaps.push(Some(h.heap.clone()));
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = want;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the
