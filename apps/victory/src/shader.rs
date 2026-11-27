@@ -27,10 +27,36 @@ impl Source<'_> {
         }
     }
 
+    /// Where it is in its file, to find it there again ([`Found::source`])
+    /// on another thread than the one that searched the file.
+    pub(crate) fn found(&self) -> Found {
+        match self {
+            Source::Raw { offset, .. } => Found::Raw(*offset),
+            Source::Packed(r) => Found::Packed(r.offset),
+        }
+    }
+
     pub(crate) fn label(&self) -> String {
         match self {
             Source::Raw { offset, .. } => format!("@{offset:#x}"),
             Source::Packed(r) => format!("@{:#x} {}", r.offset, r.name.unwrap_or("?")),
+        }
+    }
+}
+
+/// A [`Source`] by its offset in its file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Found {
+    Raw(usize),
+    Packed(usize),
+}
+
+impl Found {
+    /// The source in `data`, the file it was found in.
+    pub(crate) fn source(self, data: &[u8]) -> Option<Source<'_>> {
+        match self {
+            Found::Raw(offset) => raw_at(data, offset),
+            Found::Packed(at) => sgd5::record_at(data, at).map(Source::Packed),
         }
     }
 }
@@ -42,18 +68,21 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter_map(|offset| {
-            let tail = &data[offset..];
-            // Declared DXBC byte length: hash only the container so offline warming
-            // matches the key used at runtime.
-            let size = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
-            let data = tail.get(..size)?;
-            Container::parse(data).ok()?;
-            Some(Source::Raw { offset, data })
-        });
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| raw_at(data, offset));
     out.extend(raw);
     out
+}
+
+/// The container stored as is at `offset` of `data`, cut to its declared
+/// DXBC byte length: only the container is hashed, so offline warming
+/// matches the key used at runtime (found by [`sources`] or again by
+/// [`Found::source`] on a worker thread).
+fn raw_at(data: &[u8], offset: usize) -> Option<Source<'_>> {
+    let tail = data.get(offset..)?;
+    let size = u32::from_le_bytes(tail.get(0x18..0x1c)?.try_into().ok()?) as usize;
+    let data = tail.get(..size)?;
+    Container::parse(data).ok()?;
+    Some(Source::Raw { offset, data })
 }
 
 #[cfg(test)]
@@ -71,6 +100,9 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].label(), label);
             assert_eq!(blake3::hash(&entries[0].bytes().unwrap()), runtime_hash);
+            // Found again on a worker thread: the same bytes, the same key.
+            let again = entries[0].found().source(carrier).expect("found again");
+            assert_eq!(blake3::hash(&again.bytes().unwrap()), runtime_hash);
         }
     }
 }
