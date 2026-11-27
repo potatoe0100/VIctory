@@ -13,6 +13,8 @@ Rule for adding anything: it must fix or prevent something specific on an 8 GB N
 | --- | --- | --- |
 | Device-removal report names the call that removed it | potatoe0100 `nvidia/removal-names-its-trigger` | Crash reports from testers say what failed, so fixes can be targeted |
 | `scripts/play-4060.ps1` | this branch | The fork's launcher keeps 1536 MB of card-side buffer copies (sized on 12 GB); this uses 768 MB |
+| VIctory-NVIDIA up to 6a31e43 (27 Nov) | automatic update, tests passed | Mouse moves the camera; GPU timings include memory compares; title memory windows in card memory on PCs under 24 GB RAM |
+| `play-4060.ps1` windows cap 1536 MB | this branch | play-nvidia.ps1's 3072 MB of windows (sized for 12 GB+) plus render targets would pass the 8 GB card's budget |
 | `scripts/sync-4060.ps1` | this branch | Follows VIctory-NVIDIA and lists new upstream GPU commits to port |
 
 ## Already in the base (not merged again)
