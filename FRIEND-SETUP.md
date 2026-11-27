@@ -4,10 +4,46 @@ EXPERIMENTAL and AI-assisted (Claude). This sets up an NVIDIA build of the VIcto
 https://github.com/potatoe0100/VIctory (branch `nvidia-4060`). It is early work: expect crashes, picture faults and
 roughly 15-20 fps. It is not an official release of anything.
 
-You are Claude Code on the user's own Windows PC. Follow this document in order. The user is not a developer: do the
-work yourself, explain in short plain sentences, and hand the user only the steps marked **USER**. Keep a checklist.
+You are Claude Code on the user's own Windows PC (most likely the Code tab of the Claude desktop app). Follow this
+document in order. The user is not a developer, so:
+
+- **Do everything you can yourself.** Every check, download, install, setting and file in this doc that can be done
+  from PowerShell, you do. Only hand the user what truly needs their hands: clicking Yes on a Windows admin (UAC)
+  prompt, the BIOS, restarts, a few NVIDIA App toggles, choosing the game folder, and plugging things in. Those are
+  marked **USER**.
+- **Admin steps**: you are not elevated. Run an admin command with
+  `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command','<command>'`, tell the user a
+  Windows prompt is coming and to click Yes, then check the result yourself.
+- **Batch the restarts**: collect everything that needs a restart (page file, Memory Integrity, drivers) and BIOS
+  changes into one restart round (section 6) so the user restarts as few times as possible. After a restart the user
+  reopens this project and says "continue the VIctory setup"; your checklist and `my-setup.md` tell you where you were.
+- Explain in short plain sentences. Keep a visible checklist. One question at a time.
 If you lose this file, fetch it again from
 `https://raw.githubusercontent.com/potatoe0100/VIctory/friend-setup/FRIEND-SETUP.md`.
+
+## Before anything: are you on the user's own Windows PC?
+
+This setup only works on the user's own Windows gaming PC: it builds and runs the game there, on their RTX card.
+Check first, before doing anything else:
+
+```
+uname -s 2>/dev/null; echo "OS=$OS REMOTE=$CLAUDE_CODE_REMOTE"
+```
+(or in PowerShell: `$env:OS; $env:CLAUDE_CODE_REMOTE; nvidia-smi -L`)
+
+STOP if any of these is true: the OS is not Windows (`OS` is not `Windows_NT`, or `uname` says Linux), the
+`CLAUDE_CODE_REMOTE` variable is `true`, the working folder looks like a cloud container (`/home/user`, `/workspace`
+or similar), or `nvidia-smi -L` doesn't list an NVIDIA card. Do not clone, install or build anything. Tell the user,
+in plain words:
+
+> This session is running in the cloud, not on your PC, so it can't set up the game. To fix it:
+> 1. Make a folder on your PC called `C:\codeprojects` (File Explorer, This PC, C:, New folder).
+> 2. In the Claude desktop app, open the **Code** tab and start a new session.
+> 3. When it asks where to work, choose your computer (a local folder), not a cloud environment, and pick
+>    `C:\codeprojects`.
+> 4. Paste the same setup message again.
+
+Then end. If everything checks out (Windows, not remote, an NVIDIA card listed), carry on.
 
 ## 0. Hard rules
 
@@ -75,21 +111,47 @@ What these mean for this build (the reference PC is an RTX 4060 8 GB, i5-13600KF
 Write these facts and every setting you choose to `C:\codeprojects\victory-tools\my-setup.md` (create the folder).
 The update task (section 9) reads that file.
 
-## 3. Install prerequisites
+## 3. Install everything (you do this; the user only clicks Yes on admin prompts)
 
-Install only what is missing, with `winget`:
+First check what is there, then install only what is missing. Run the checks yourself and show the user a short
+"have / need" list.
 
 ```powershell
-winget install --id Git.Git -e
-winget install --id Rustlang.Rustup -e
-winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget --version                                   # App Installer; missing on very old Windows 10 builds
+git --version
+rustup --version; cargo --version
+& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory -ErrorAction SilentlyContinue | Select-Object -Last 1 Name
+nvidia-smi --query-gpu=driver_version --format=csv,noheader
+Get-Command claude -ErrorAction SilentlyContinue
+Get-PSDrive C | Select-Object Used,Free
+Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'   # True: restart first
 ```
 
-- Rust is pinned in `rust-toolchain.toml` (1.98.1, x86_64-pc-windows-msvc). The first `cargo` command in the repo
-  fetches it. Don't install or select another toolchain.
-- The build needs the MSVC C++ build tools ("Desktop development with C++" / VCTools workload, which brings a Windows
-  SDK). Open a NEW PowerShell after installing so PATH updates, then check `git --version` and `cargo --version`.
-- Also install the AMD chipset driver for AM5 (from AMD's site) if it isn't there, and a current NVIDIA driver.
+| Need | Why | How (you run it) |
+|---|---|---|
+| ~60 GB free on the build drive | Build ~10 GB, shader caches 20+ GB, page file 32 GB on C: | If short, tell the user and stop until there is room. Put `cache_dir`/`data_dir` on another drive if that helps. |
+| winget | Installs the rest | If missing: `Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe`, else open the Microsoft Store page for "App Installer" for the **USER** to click Install. |
+| Git for Windows | Clone and updates (the Code tab also uses it) | `winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements` |
+| Visual Studio 2022 Build Tools, C++ workload + Windows SDK | Rust's MSVC linker, the assembler for one crate, and `dxil.dll` for shader tests | `winget install --id Microsoft.VisualStudio.2022.BuildTools -e --accept-source-agreements --accept-package-agreements --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` (several GB, 10-30 min; one UAC prompt) |
+| rustup | Fetches the pinned Rust 1.98.1 by itself on the first `cargo` command in the repo | `winget install --id Rustlang.Rustup -e --accept-source-agreements --accept-package-agreements`. Don't install another toolchain. |
+| Current NVIDIA driver | Game Ready driver for the 4070 Ti; Smooth Motion needs a recent one | Compare `nvidia-smi`'s version with the latest on nvidia.com for the RTX 4070 Ti. If older, install the NVIDIA App (`winget search "NVIDIA App"`, install the match published by NVIDIA) and have the **USER** click its driver update, or download the driver yourself and run it (UAC). |
+| AMD chipset driver (AM5) | Correct power and core handling on the Ryzen 7 7700 | Check Installed apps for "AMD Chipset Software". If missing, download the latest AM5 chipset driver from amd.com and run it (UAC). |
+| Claude Code command line | The update task's review step (section 9) | See the note below the table. Optional: updates still work without it. |
+| Controller driver | Xbox-style pads work out of the box on Windows | Nothing to install for Xbox pads. Other pads need XInput mode (e.g. Steam Input or the pad's own switch). |
+
+Claude Code command line: if `Get-Command claude` finds nothing (the desktop app doesn't always add it), run
+`irm https://claude.ai/install.ps1 | iex` in PowerShell, then have the **USER** run `claude` once in a new PowerShell
+window and sign in with the same account.
+
+For admin steps with several lines, write them to a temporary `.ps1` under `C:\codeprojects\victory-tools` and run it
+with `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','<that file>'`.
+
+After installs, PATH changes only reach new processes. Refresh it in your shell instead of asking for a restart:
+`$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')`,
+then re-run the checks. Also run `git config --global core.longpaths true` (deep paths under `target\`).
+
+If any install fails, read its log, retry once, and only then explain the problem to the user in one or two lines.
 
 ## 4. Clone, configure, build, test
 
@@ -171,37 +233,65 @@ target\diag\victory.exe shaders        # uses game_dir from victory.toml
 First launch: it can sit on a black screen for 10+ minutes while shaders and pipelines are built. Don't kill it.
 Later launches are much faster. Each new place still stalls briefly the first time.
 
-## 6. By-hand steps (walk the USER through these one at a time; confirm each)
+## 6. PC settings (do the Windows ones yourself; BIOS and a few toggles are the USER's)
 
-Tell the user to save their work before anything that restarts the PC.
+Order: do every item you can (A) first, then one restart round for the BIOS (B), then the NVIDIA App toggles (C).
+Tell the user to save their work before any restart. Record each result in `my-setup.md`.
 
-1. **EXPO/XMP memory profile on** (BIOS, usually under the memory or "AI Tweaker/OC" page). Before they go in, tell
-   them two things:
+**A. You do these (each needs one UAC Yes from the USER):**
+
+1. **Fixed 32 GB page file** (the game commits about 33 GB in the world; with a Windows-managed page file the
+   reference PC came within 0.8 GB of the limit; running out shows as `0x8007000E` or error 1455 in `crashes.log`).
+   Use the drive with the most free space if C: is short:
+   ```powershell
+   $cs = Get-CimInstance Win32_ComputerSystem
+   Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $false }
+   $pf = Get-CimInstance Win32_PageFileSetting
+   if (-not $pf) { $pf = New-CimInstance -ClassName Win32_PageFileSetting -Property @{ Name = 'C:\pagefile.sys' } }
+   $pf | Set-CimInstance -Property @{ InitialSize = [uint32]32768; MaximumSize = [uint32]32768 }
+   ```
+   (Run as admin. Takes effect after the restart in B.)
+2. **Power**: `powercfg /setactive SCHEME_MIN` (High performance; no admin needed). If that scheme is hidden, leave the
+   plan and have the **USER** set Settings, System, Power, Power mode to "Best performance".
+3. **Memory Integrity off** (optional): it saves some CPU time and turns off one security layer. Ask the **USER** first
+   in one sentence. If yes (admin):
+   `reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled /t REG_DWORD /d 0 /f`
+   (takes effect after the restart in B; check afterwards in Windows Security, Device security, Core isolation).
+4. **Hardware-accelerated GPU scheduling**: leave it as it is.
+
+**B. One restart into the BIOS (USER, with you guiding by text; they can read your steps on their phone):**
+
+Find the motherboard model first (`Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product`) so you can
+name the exact menu paths for that board, and give the BIOS key (usually Del or F2 at power-on). Then, in one visit:
+
+1. **EXPO (or XMP) profile on** for the Kingston Fury kit. Warn before they go in:
    - On AM5 the first boot after changing memory settings trains the memory and can show a black screen for several
-     minutes. Wait at least 5 minutes before touching anything. A "Memory Context Restore" option (if the board has
-     it) makes later boots faster.
-   - If the PC then won't boot and only the DRAM debug light on the board stays on, it is not damaged. Turn it fully
-     off, switch the PSU off for 30 seconds, and start again. If it repeats, clear the CMOS (the board's jumper or
-     button, or the battery out for a minute) and run the memory one speed step below its rating.
-2. **Resizable BAR on** (BIOS: "Above 4G Decoding" and "Re-Size BAR Support"; CSM must be off). Check afterwards with
-   `nvidia-smi -q` (BAR1 total near 12 GB).
-3. **Fixed 32 GB page file.** The game commits about 33 GB in the world; with a Windows-managed page file the reference
-   PC came within 0.8 GB of the limit. Start, type `advanced system settings`, Performance Settings, Advanced, Virtual
-   memory Change, untick "Automatically manage", pick C: (or the fastest SSD), Custom size 32768 and 32768, Set, OK,
-   restart. Running out shows as `0x8007000E` or Windows error 1455 in `crashes.log`.
-4. **NVIDIA shader cache size 100 GB** (NVIDIA Control Panel, Manage 3D settings, Shader Cache Size; or NVIDIA App,
-   Graphics, Global settings).
-5. **Power management mode: Prefer maximum performance** (same place) and Windows power mode "Best performance".
-6. **Memory Integrity off** (optional): Windows Security, Device security, Core isolation. It saves some CPU time;
-   it also turns off a security layer. The user's call; restart after.
-7. **Smooth Motion** (optional, never required): NVIDIA App, Graphics, Program settings, add
-   `C:\codeprojects\victory\target\diag\victory_sm.exe`, turn Smooth Motion on. It's driver frame generation: smoother
-   to look at, about one frame more input lag, smearing on fast turns. Report real fps, not generated.
-8. **Controller** recommended (Xbox-style, XInput). Keyboard and mouse also work in this build while no controller is
-   connected: press F2 (or the backtick key) to lock mouse-look; Esc or P releases it. Left click shoots, right click
-   aims, WASD moves, Shift sprints, Space jumps, F enters vehicles, Tab weapon wheel, Esc/P pause. Full table in
-   `README-4060.md`.
-9. Close the browser and other heavy apps before playing; no builds or tests running.
+     minutes. Wait at least 5 minutes before touching anything. "Memory Context Restore", if the board has it, makes
+     later boots fast.
+   - If the PC then won't boot and only the DRAM debug light stays on, it is not damaged. Turn it fully off, switch the
+     PSU off for 30 seconds, and start again. If it repeats, clear the CMOS (the board's jumper or button, or the
+     battery out for a minute) and run the memory one speed step below its rating.
+2. **Resizable BAR**: "Above 4G Decoding" on and "Re-Size BAR Support" on (often under PCI Subsystem or Advanced;
+   needs CSM off, which it already is on most Windows 11 installs).
+3. Leave the integrated graphics on; just make sure the **monitor cable is in the graphics card**.
+4. Save and exit. Back in Windows, the **USER** reopens this project and says "continue the VIctory setup". You then
+   check: `ConfiguredClockSpeed` matches the kit, BAR1 total near 12 GB (`nvidia-smi -q`), the page file is 32768
+   (`Get-CimInstance Win32_PageFileSetting`), Memory Integrity state. Fix anything that didn't stick.
+
+**C. NVIDIA App toggles (USER clicks; you say exactly where):**
+
+1. **Shader cache size 100 GB**: NVIDIA App, Graphics, Global settings, Shader Cache Size (or NVIDIA Control Panel,
+   Manage 3D settings).
+2. **Power management mode: Prefer maximum performance** (same list).
+3. **Smooth Motion** (optional, never required): Graphics, Program settings, add
+   `C:\codeprojects\victory\target\diag\victory_sm.exe` (exists after the first launch), turn Smooth Motion on. It's
+   driver frame generation: smoother to look at, about one frame more input lag, smearing on fast turns. Report real
+   fps, not generated.
+
+**D. Before playing (USER):** plug in a controller if they have one (Xbox-style is easiest). Keyboard and mouse also
+work while no controller is connected: F2 (or backtick) locks mouse-look, Esc or P releases it; left click shoots,
+right click aims, WASD moves, Shift sprints, Space jumps, F enters vehicles, Tab weapon wheel. Full table in
+`README-4060.md`. Close the browser and other heavy apps.
 
 ## 7. What to expect (from the reference PC's first run, 27 Nov 2026, build tested-2026-11-27-1425)
 
