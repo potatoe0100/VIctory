@@ -1,6 +1,6 @@
 # victory-update.ps1: keeps this PC on the newest tested build of potatoe0100/VIctory (branch nvidia-4060).
 # EXPERIMENTAL, AI-assisted (Claude). Lives OUTSIDE the repo, in C:\codeprojects\victory-tools. Run by the scheduled task
-# "VIctory update" (see FRIEND-SETUP.md section 9), or by hand:
+# "VIctory update" (see EXTERNAL-SETUP.md section 9), or by hand:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File C:\codeprojects\victory-tools\victory-update.ps1 [-CheckOnly]
 #
 # What it does, in order:
@@ -16,7 +16,7 @@
 param(
     [string]$Repo = 'C:\codeprojects\victory',
     [string]$Branch = 'nvidia-4060',
-    [string]$DocBranch = 'friend-setup',
+    [string]$DocBranch = 'external-setup',
     [string]$LocalBranch = 'local',
     [string]$Adapter = '',          # e.g. 4070: the card the tests run on (see my-setup.md)
     [switch]$SkipTests,
@@ -113,7 +113,7 @@ if (Test-Path $lockFile) {
     if ((Get-Item $lockFile).LastWriteTime -gt (Get-Date).AddHours(-6)) { Log 'Skipped: another update is running.'; return }
     Remove-Item $lockFile -Force
 }
-if (-not (Test-Path (Join-Path $Repo '.git'))) { Status "No repository at $Repo. Ask Claude Code to redo the setup (FRIEND-SETUP.md)."; return }
+if (-not (Test-Path (Join-Path $Repo '.git'))) { Status "No repository at $Repo. Ask Claude Code to redo the setup (EXTERNAL-SETUP.md)."; return }
 Set-Content $lockFile $PID
 
 try {
@@ -147,13 +147,13 @@ try {
         # Only tracked files count: victory.toml and target\ are ignored by git.
         $dirty = Invoke-Git status --porcelain --untracked-files=no
         if ($dirty) {
-            Status "A newer build ($newTag) is out, but the repo has uncommitted edits, so it was left alone. Ask Claude Code to look (FRIEND-SETUP.md section 9).`r`n$($dirty -join "`r`n")"
+            Status "A newer build ($newTag) is out, but the repo has uncommitted edits, so it was left alone. Ask Claude Code to look (EXTERNAL-SETUP.md section 9).`r`n$($dirty -join "`r`n")"
             return
         }
         $prevHead = (Invoke-Git rev-parse HEAD | Select-Object -First 1)
         $hasLocal = (TryGit rev-parse --verify --quiet "refs/heads/$LocalBranch").Ok
         if ($hasLocal -and -not $curTag) {
-            Status "A newer build ($newTag) is out, but this PC has its own branch ($LocalBranch) and no record of which build it sits on, so nothing changed. Ask Claude Code to rebase it by hand (FRIEND-SETUP.md section 9)."
+            Status "A newer build ($newTag) is out, but this PC has its own branch ($LocalBranch) and no record of which build it sits on, so nothing changed. Ask Claude Code to rebase it by hand (EXTERNAL-SETUP.md section 9)."
             return
         }
         if ($hasLocal) {
@@ -163,7 +163,7 @@ try {
             if (-not $r.Ok) {
                 TryGit rebase --abort | Out-Null
                 Invoke-Git reset -q --hard $prevHead | Out-Null
-                Status "A newer build ($newTag) is out, but this PC's own changes (branch $LocalBranch) clash with it, so nothing changed. Ask Claude Code to merge them by hand (FRIEND-SETUP.md section 9)."
+                Status "A newer build ($newTag) is out, but this PC's own changes (branch $LocalBranch) clash with it, so nothing changed. Ask Claude Code to merge them by hand (EXTERNAL-SETUP.md section 9)."
                 return
             }
         } else {
@@ -203,12 +203,12 @@ try {
             $parts += (Invoke-Git diff "$from..$newTag" '--' README-4060.md CHANGES-4060.md scripts victory.example.toml rust-toolchain.toml)
         }
         if ($docChanged) {
-            $parts += ''; $parts += '## FRIEND-SETUP.md changes'
-            $parts += (Invoke-Git diff "$($state.doc)..$docHead" '--' FRIEND-SETUP.md victory-update.ps1)
+            $parts += ''; $parts += '## EXTERNAL-SETUP.md changes'
+            $parts += (Invoke-Git diff "$($state.doc)..$docHead" '--' EXTERNAL-SETUP.md victory-update.ps1)
         }
         Set-Content -Path $ctx -Value ($parts -join "`r`n")
         # One line, no double quotes: it goes through claude's command-line shim unchanged.
-        $prompt = 'You are maintaining an experimental VIctory setup on this PC. Read update-context.md (what changed upstream), my-setup.md (this PC''s hardware and chosen settings) and the launcher wrappers (*.cmd) in this folder. Decide whether the wrappers or settings need changing because of the update, for example a renamed or new launcher option, a changed preset, or a new recommended switch for this PC''s card. If a change is small and clearly needed, make it in the files in this folder only, and note it at the end of my-setup.md with today''s date. Never edit the repository, never touch game files, never post anything online. If FRIEND-SETUP.md or victory-update.ps1 changed, do not apply them; say in one line what the user should ask Claude Code to redo. Then reply with at most 6 short plain-English lines for a non-developer: what changed that matters to them, what you changed, and anything they need to do.'
+        $prompt = 'You are maintaining an experimental VIctory setup on this PC. Read update-context.md (what changed upstream), my-setup.md (this PC''s hardware and chosen settings) and the launcher wrappers (*.cmd) in this folder. Decide whether the wrappers or settings need changing because of the update, for example a renamed or new launcher option, a changed preset, or a new recommended switch for this PC''s card. If a change is small and clearly needed, make it in the files in this folder only, and note it at the end of my-setup.md with today''s date. Never edit the repository, never touch game files, never post anything online. If EXTERNAL-SETUP.md or victory-update.ps1 changed, do not apply them; say in one line what the user should ask Claude Code to redo. Then reply with at most 6 short plain-English lines for a non-developer: what changed that matters to them, what you changed, and anything they need to do.'
         Log 'Asking Claude to review the update'
         $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         Push-Location $Tools
@@ -222,7 +222,7 @@ try {
                 ConvertTo-Json | Set-Content $stateFile
         }
     } elseif ($docChanged -and -not $moved) {
-        $summary = 'The setup instructions (FRIEND-SETUP.md) changed. Ask Claude Code: "re-read FRIEND-SETUP.md and apply what changed".'
+        $summary = 'The setup instructions (EXTERNAL-SETUP.md) changed. Ask Claude Code: "re-read EXTERNAL-SETUP.md and apply what changed".'
         @{ tag = $curTag; head = (Invoke-Git rev-parse HEAD | Select-Object -First 1); doc = $docHead; when = (Get-Date).ToString('s') } |
             ConvertTo-Json | Set-Content $stateFile
     }

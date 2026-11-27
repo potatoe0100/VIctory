@@ -1,4 +1,4 @@
-# FRIEND-SETUP.md (instructions for Claude Code)
+# EXTERNAL-SETUP.md (instructions for Claude Code)
 
 EXPERIMENTAL and AI-assisted (Claude). This sets up an NVIDIA build of the VIctory GTA VI recompilation layer from
 https://github.com/potatoe0100/VIctory (branch `nvidia-4060`). It is early work: expect crashes, picture faults and
@@ -19,7 +19,7 @@ document in order. The user is not a developer, so:
   reopens this project and says "continue the VIctory setup"; your checklist and `my-setup.md` tell you where you were.
 - Explain in short plain sentences. Keep a visible checklist. One question at a time.
 If you lose this file, fetch it again from
-`https://raw.githubusercontent.com/potatoe0100/VIctory/friend-setup/FRIEND-SETUP.md`.
+`https://raw.githubusercontent.com/potatoe0100/VIctory/external-setup/EXTERNAL-SETUP.md`.
 
 ## Before anything: are you on the user's own Windows PC?
 
@@ -329,7 +329,7 @@ The user wants this PC to follow the newest tested build automatically.
 1. Download the update script next to the wrappers (it is plain PowerShell; read it before registering it, and tell
    the user in one line what it does):
    ```powershell
-   Invoke-WebRequest https://raw.githubusercontent.com/potatoe0100/VIctory/friend-setup/victory-update.ps1 -OutFile C:\codeprojects\victory-tools\victory-update.ps1
+   Invoke-WebRequest https://raw.githubusercontent.com/potatoe0100/VIctory/external-setup/victory-update.ps1 -OutFile C:\codeprojects\victory-tools\victory-update.ps1
    ```
 2. `C:\codeprojects\victory-tools\settings.json`: `{"Adapter":"4070","SkipTests":false,"NoClaude":false}`.
 3. Record the starting point and test it: run
