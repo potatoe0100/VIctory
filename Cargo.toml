@@ -83,7 +83,9 @@ inherits = "release"
 [profile.release-lto]
 inherits = "release"
 lto = "thin"
+codegen-units = 1
 
 [profile.diag-lto]
 inherits = "diag"
 lto = "thin"
+codegen-units = 1
