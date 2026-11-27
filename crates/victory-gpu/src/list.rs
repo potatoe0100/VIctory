@@ -808,12 +808,17 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
+            let before_legal = crate::host::legal_state(texture, before);
+            let after_legal = crate::host::legal_state(texture, wanted);
+            if before_legal == after_legal {
+                return None;
+            }
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
-                second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                second: 0xffff_ffff | (u64::from(before_legal) << 32),
+                last: u64::from(after_legal),
             })
         }
         1 => Some(Barrier {
