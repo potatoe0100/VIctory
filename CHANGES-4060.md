@@ -15,6 +15,10 @@ Rule for adding anything: it must fix or prevent something specific on an 8 GB N
 | `scripts/play-4060.ps1` | this branch | The fork's launcher keeps 1536 MB of card-side buffer copies (sized on 12 GB); this uses 768 MB |
 | VIctory-NVIDIA up to 6a31e43 (27 Nov) | automatic update, tests passed | Mouse moves the camera; GPU timings include memory compares; title memory windows in card memory on PCs under 24 GB RAM |
 | `play-4060.ps1` windows cap 1536 MB | this branch | play-nvidia.ps1's 3072 MB of windows (sized for 12 GB+) plus render targets would pass the 8 GB card's budget |
+| Androtim/MiniVI up to 370cd42 | fork of VIctory-NVIDIA 7480e96, GPL-3 | Texture and render-target pools scaled for <=9 GiB cards (target room 1,797 instead of 3,072 MiB on this card), unheld mip tiles reclaimed, levels on demand no longer skips the texture pool. Author: 4060 Ti 8 GB VRAM 7.7 -> 5.1 GB |
+| Voltexs 5efbc85 (+ test fix as 2312e87) | Voltexs/VIctory-RTXNvidia | Dynamic descriptor slots go back when a flight lands, not 64 flights later: on the capped NVIDIA heap the author saw a median 555 dropped draws a frame without it. 49241dd not needed (MiniVI already guards frees by heap identity) |
+| TextureQueue recheck fix (from Voltexs 753fa59, that hunk only) | Voltexs/VIctory-RTXNvidia | Stops about 2,000 needless 48 KiB texture re-hashes a second |
+| Presets safe / balanced / fast | this branch | 480p 512 MB + levels on demand / 540p 1,024 MB / 540p 1,536 MB, each checked against the card's budget and 1 GB less |
 | `scripts/sync-4060.ps1` | this branch | Follows VIctory-NVIDIA and lists new upstream GPU commits to port |
 
 ## Already in the base (not merged again)
@@ -49,6 +53,7 @@ Rule for adding anything: it must fix or prevent something specific on an 8 GB N
 | --- | --- | --- | --- |
 | VIctory-NVIDIA 7480e96 (base) | 927 | 0 | 45 |
 | nvidia-4060 (with the crash-report fix) | 931 | 0 | 45 |
+| + MiniVI, Voltexs fixes, presets (27 Nov, `VICTORY_DYNAMIC_SLOTS=524288`) | 962 | 0 | 45 |
 
 Also on the 4060:
 - `levels_on_demand_on_the_card` (ignored by default; `VICTORY_TILES_TEST_CARD=1`, release): all steps passed on the

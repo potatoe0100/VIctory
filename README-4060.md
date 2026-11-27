@@ -9,8 +9,12 @@ the RTX 4060. What was added and why is in [CHANGES-4060.md](CHANGES-4060.md).
 
 ## What to expect
 
-- On a 12 GB card the base fork gets about 20 fps in the prologue. An 8 GB card is slower and has less room, so
-  expect lower, and expect the picture to be soft (it renders at 540p and upscales).
+- On a 12 GB card the base fork gets about 20 fps in the prologue. On an 8 GB RTX 4060 expect about 10 to 17 real
+  fps (an unmeasured estimate), and a soft picture (it renders at 540p and upscales).
+- NVIDIA Smooth Motion (driver frame generation) is used to start with, because the real frame rate is low: the
+  launcher runs `victory_sm.exe`, and ticking Smooth Motion for that program in the NVIDIA App turns it on. Below
+  about 15 real fps expect smearing on fast camera moves and about one frame of extra input lag. The aim is to turn it
+  off (`-NoSmoothMotion`) once the real frame rate allows.
 - The first time a place is seen it stalls while shaders are made.
 - If the card runs out of video memory, Windows moves part of it into the PC's memory and the frame rate falls hard.
   That is the main thing this branch tries to avoid.
