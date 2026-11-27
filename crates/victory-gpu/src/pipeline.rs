@@ -750,10 +750,20 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if at + size > desc.size {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                stream_size = desc.size,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, and the stream may be unaligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -941,5 +951,68 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn a_stream_of_any_alignment_is_read() {
+        let (ms, ps) = ([9u8; 7], [4u8; 5]);
+        let mut backing = vec![0u8; 0x2b0 + 8];
+        for skew in 1..8usize {
+            let stream = &mut backing[skew..skew + 0x2b0];
+            stream.fill(0);
+            let mut put =
+                |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
+            for (at, kind) in [
+                (0x10, 24),
+                (0x28, 2),
+                (0x40, 3),
+                (0x58, 4),
+                (0x70, 5),
+                (0x88, 8),
+                (0x1d8, 9),
+                (0x1e0, 10),
+                (0x210, 21),
+                (0x250, 17),
+                (0x260, 12),
+                (0x278, 14),
+                (0x280, 15),
+                (0x2a8, 16),
+            ] {
+                put(at, kind);
+            }
+            put(0x18, ms.as_ptr() as u64);
+            put(0x20, ms.len() as u64);
+            put(0x30, ps.as_ptr() as u64);
+            put(0x38, ps.len() as u64);
+            put(0x278, 14 | (3 << 32));
+            put(0x280, 15 | (28 << 32));
+            put(0x2a0, 1 << 32);
+
+            let desc = StreamDesc {
+                size: stream.len(),
+                stream: stream.as_ptr(),
+            };
+            let mut p = std::ptr::null();
+            let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+            assert_eq!(hr, S_OK);
+            assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        }
+
+        // A truncated shader subobject (16 bytes < 24) must not read past `desc.size`.
+        let mut truncated = [0u8; 16];
+        truncated[0..4].copy_from_slice(&1u32.to_le_bytes());
+        truncated[8..16].copy_from_slice(&(ms.as_ptr() as u64).to_le_bytes());
+        let desc = StreamDesc {
+            size: truncated.len(),
+            stream: truncated.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        assert!(shaders(p).is_empty());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 }

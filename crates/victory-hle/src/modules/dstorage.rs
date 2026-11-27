@@ -643,18 +643,37 @@ fn scheduler() -> Option<&'static Scheduler> {
         }
         let workers = overridden
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        // `VICTORY_DSTORAGE_PRIORITY=-1`: below normal priority (-2..2; unset or 0:
+        // normal, as before, our off-by-default rule; trustno1-coder/VIctory-NVIDIA
+        // PR #39, from foxhound, where -1 is the default): while a scene
+        // streams in, every worker unpacks at once and the threads a frame waits for
+        // stood "woken, not running yet". i5-13600KF + RTX 4070 Ti, A/B/A/B: median
+        // and p90 within noise, worst 5-second windows 134 -> 105 ms and 361 -> 98 ms.
+        let priority = std::env::var("VICTORY_DSTORAGE_PRIORITY")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .map_or(0, |p| p.clamp(-2, 2));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || {
+                        #[cfg(windows)]
+                        if priority != 0 {
+                            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+                            // SAFETY: this thread's own priority.
+                            unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
         tracing::info!(
             workers = started,
             overridden = overridden.is_some(),
-            "dstorage: workers"
+            priority,
+            "dstorage: workers (VICTORY_DSTORAGE_WORKERS, VICTORY_DSTORAGE_PRIORITY)"
         );
     });
     Some(scheduler)
