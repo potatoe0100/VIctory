@@ -43,7 +43,7 @@ foreach ($k in $presets[$Preset].Settings.Keys) { $fit8gb[$k] = $presets[$Preset
 if ($Tweaks) { $fit8gb.VICTORY_BAKE_TEXTURES_MS = '0'; $fit8gb.VICTORY_SHADER_LOOP_LIMIT = '256'; Write-Host 'Tweaks: on (A/B)' }
 foreach ($k in $More.Keys) { $fit8gb[$k] = $More[$k] }
 if (-not $Resolution) { $Resolution = $presets[$Preset].Resolution }
-Write-Host "Preset: $Preset"
+Write-Host "Preset: $Preset"; if ($Preset -eq 'max') { Write-Host 'The max preset is experimental and may spill past the card''s memory.' -ForegroundColor Yellow }
 $splat = @{ Exe = $Exe; More = $fit8gb; Build = $Build; Quality = $Quality; NoSmoothMotion = $NoSmoothMotion; Resolution = $Resolution }
 if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
     $splat.WindowsBarMB = $WindowsBarMB
