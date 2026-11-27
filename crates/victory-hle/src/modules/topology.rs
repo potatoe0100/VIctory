@@ -132,6 +132,50 @@ fn pin_shift() -> u32 {
     })
 }
 
+/// `VICTORY_PIN_SPREAD=1` (off by default; wins over `VICTORY_PIN_SHIFT`):
+/// the title's CPU `n` becomes logical CPU `2n + 2`, one thread per physical
+/// core and core 0 left to the system's interrupts, on a CPU whose SMT pairs
+/// are numbered next to each other (Intel's P-cores: 0/1, 2/3, ...). The
+/// title pins its threads to CPUs 0-3, which is two physical cores there.
+fn pin_spread() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIN_SPREAD").is_some_and(|v| v == "1"))
+}
+
+/// `mask` spread (`out`) or gathered back: bit `n` to bit `2n + 2` within
+/// `count` CPUs. A mask with a bit that would land past the last CPU, or
+/// (gathering) one not on such a CPU, passes unchanged.
+fn spread(mask: usize, out: bool, count: u32) -> usize {
+    let count = count.min(usize::BITS);
+    let mut moved = 0usize;
+    for bit in 0..count {
+        if mask & (1 << bit) == 0 {
+            continue;
+        }
+        let to = if out {
+            2 * bit + 2
+        } else if bit >= 2 && bit % 2 == 0 {
+            (bit - 2) / 2
+        } else {
+            return mask;
+        };
+        if to >= count {
+            return mask;
+        }
+        moved |= 1 << to;
+    }
+    if moved == 0 { mask } else { moved }
+}
+
+/// A processor number moved as [`spread`] moves its bit.
+fn spread_processor(processor: u32, out: bool, count: u32) -> u32 {
+    if processor >= count || processor >= usize::BITS {
+        return processor;
+    }
+    let mask = spread(1 << processor, out, count);
+    if mask == 1 << processor { processor } else { mask.trailing_zeros() }
+}
+
 /// `mask` rotated by `shift` within `count` logical CPUs (left, or right to
 /// undo): same count, never empty. Masks past the last CPU, or empty, pass
 /// unchanged.
@@ -147,6 +191,9 @@ fn rotate(mask: usize, shift: u32, left: bool, count: u32) -> usize {
 /// `processor` moved by the pin shift (back, when not `left`) within the CPU
 /// count; numbers past it (queries, errors) pass unchanged.
 fn shift_processor(processor: u32, left: bool) -> u32 {
+    if pin_spread() {
+        return spread_processor(processor, left, cpu_count());
+    }
     shift_processor_by(processor, left, pin_shift(), cpu_count())
 }
 
@@ -178,7 +225,8 @@ pub extern "system" fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usi
     }
     let shift = pin_shift();
     let count = cpu_count();
-    let shifted = rotate(mask, shift, true, count);
+    let spreading = pin_spread();
+    let shifted = if spreading { spread(mask, true, count) } else { rotate(mask, shift, true, count) };
     // SAFETY: the title's thread handle and a mask of the same CPU count.
     let previous = unsafe { SetThreadAffinityMask(thread, shifted) };
     if shifted != mask {
@@ -201,7 +249,7 @@ pub extern "system" fn SetThreadAffinityMask(thread: Handle, mask: usize) -> usi
     }
     note("SetThreadAffinityMask", mask as u64);
     // The title may restore the previous mask; hand it back in its own terms.
-    rotate(previous, shift, false, count)
+    if spreading { spread(previous, false, count) } else { rotate(previous, shift, false, count) }
 }
 
 /// Shifted like the masks, so ideal and affinity stay on the same CPUs.
@@ -241,8 +289,7 @@ pub extern "system" fn SetThreadIdealProcessorEx(
     note("SetThreadIdealProcessorEx", original.map_or(u64::MAX, u64::from));
     result
 }
-// Negative priorities show sign-extended.
-forward!(SetThreadPriority(thread: Handle, priority: i32) -> i32, priority as u64);
+// (SetThreadPriority is left to the kernel module's title_priority.)
 forward!(GetSystemInfo(info: *mut c_void) -> (), 0);
 forward!(GetNativeSystemInfo(info: *mut c_void) -> (), 0);
 forward!(GetLogicalProcessorInformation(buffer: *mut c_void, length: *mut u32) -> i32, 0);
@@ -306,7 +353,6 @@ pub(crate) fn module() -> HleModule {
             hle_export!(SetThreadAffinityMask),
             hle_export!(SetThreadIdealProcessor),
             hle_export!(SetThreadIdealProcessorEx),
-            hle_export!(SetThreadPriority),
             hle_export!(GetSystemInfo),
             hle_export!(GetNativeSystemInfo),
             hle_export!(GetLogicalProcessorInformation),
@@ -320,6 +366,21 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's CPUs 0-3 go to one thread per physical core, core 0 left
+    /// out, and back; a mask that would not fit passes unchanged.
+    #[test]
+    fn spread_moves_cpus_to_their_own_cores_and_back() {
+        assert_eq!(spread(0b1111, true, 20), 0b1_0101_0100);
+        assert_eq!(spread(0b1_0101_0100, false, 20), 0b1111);
+        assert_eq!(spread(0b1, true, 20), 0b100);
+        assert_eq!(spread(1 << 10, true, 20), 1 << 10);
+        assert_eq!(spread(0b10, false, 20), 0b10);
+        assert_eq!(spread(0, true, 20), 0);
+        assert_eq!(spread_processor(3, true, 20), 8);
+        assert_eq!(spread_processor(8, false, 20), 3);
+        assert_eq!(spread_processor(u32::MAX, true, 20), u32::MAX);
+    }
 
     #[test]
     fn counts_every_call_and_each_value_once() {
