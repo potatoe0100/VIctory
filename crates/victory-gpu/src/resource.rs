@@ -1841,8 +1841,10 @@ pub(crate) fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Opt
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072, or capped at
-/// `budget / 4` on `<= 9 GiB` cards; 0: none) less what such copies hold now.
+/// not made yet, less what such copies hold now: at most 3,072 MiB (capped
+/// at `budget / 4` on `<= 9 GiB` cards), sized by the most the targets have
+/// held ([`targets_kept_from_peak`]); `VICTORY_CARD_ROOM_FOR_TARGETS_MB` set
+/// keeps that amount flat, as before (0: none).
 #[cfg(windows)]
 pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1855,7 +1857,30 @@ pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     let most = targets_room_kept_bytes(vram_budget, override_mb);
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    if override_mb.is_some() {
+        return most.saturating_sub(targets);
+    }
+    // The most the targets have held this run: what the room is sized by
+    // (`targets_kept_from_peak`), unless the switch above set it flat.
+    static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let peak = PEAK.fetch_max(targets, Relaxed).max(targets);
+    targets_kept_from_peak(most, targets, peak)
+}
+
+/// What [`targets_room_kept`] keeps of `most` without the switch: half as
+/// much again as the targets have held at their most (`peak`), and at least
+/// 256 MiB, never more than `most` (VIctory-NVIDIA PR #76, 05a269d8).
+///
+/// Measured there on an 8 GB card (RTX 4060 Laptop, 2026-11-27): the
+/// targets of a 720p world held 390 MB, so the flat reserve kept 2,675 MB
+/// for them the whole run, the texture queue refused new textures with the
+/// card 41 % used, and passers-by's skin textures were never uploaded (black
+/// faces). Sized by the peak, the same run keeps 195 MB.
+#[cfg(any(windows, test))]
+fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
+    /// Room for targets to grow into while they are still being made.
+    const LEAST: u64 = 256 << 20;
+    peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -4786,6 +4811,25 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(targets_room_kept_bytes(Some(8 * GIB), Some(1024)), 1024 * MIB);
         assert_eq!(targets_room_kept_bytes(Some(8 * GIB), Some(0)), 0);
         assert_eq!(targets_room_kept_bytes(Some(24 * GIB), Some(10_000)), 8192 * MIB);
+    }
+
+    /// The room kept for render targets follows the most they have held,
+    /// not a flat 3,072 MB.
+    #[test]
+    fn room_for_targets_follows_their_peak() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        // The SeriesS profile on an 8 GB card: the targets stay at 390 MB,
+        // and 195 MB is kept where the flat reserve kept 2,682 MB.
+        assert_eq!(targets_kept_from_peak(most, 390 * MIB, 390 * MIB), 195 * MIB);
+        // A world's first frames: half as much again as their peak so far.
+        assert_eq!(targets_kept_from_peak(most, 650 * MIB, 650 * MIB), 325 * MIB);
+        // 1440p: the peak passes what the switch allows; never more than it.
+        assert_eq!(targets_kept_from_peak(most, 2900 * MIB, 2900 * MIB), 172 * MIB);
+        // A scene's targets given back: the peak still holds what they may want.
+        assert_eq!(targets_kept_from_peak(most, 0, 2900 * MIB), most);
+        // Nothing made yet: at least 256 MiB.
+        assert_eq!(targets_kept_from_peak(most, 0, 0), 256 * MIB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that
