@@ -16,6 +16,9 @@
 #   balanced  540p, 768 MB (the default)
 #   fast      480p, 896 MB (most frames a second; the most buffer copies that still fit with 1 GB less free)
 # -Resolution overrides the preset's resolution.
+# -Tweaks: two settings to compare against a run without them (A/B; not known to help yet):
+#   VICTORY_BAKE_TEXTURES_MS=0 (no wait for textures before the title's decoration bake draws) and
+#   VICTORY_SHADER_LOOP_LIMIT=256 (translated shader loops stop sooner; diagnostics build only).
 # Extra settings can still be passed: -More @{VICTORY_CARD_BUFFERS_MB='512'}
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -25,7 +28,8 @@ param(
     [switch]$NoSmoothMotion,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [uint32]$WindowsBarMB
+    [uint32]$WindowsBarMB,
+    [switch]$Tweaks
 )
 $presets = @{
     safe     = @{ Resolution = '480'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '512'; VICTORY_LEVELS_ON_DEMAND = '1' } }
@@ -34,6 +38,7 @@ $presets = @{
 }
 $fit8gb = @{}
 foreach ($k in $presets[$Preset].Settings.Keys) { $fit8gb[$k] = $presets[$Preset].Settings[$k] }
+if ($Tweaks) { $fit8gb.VICTORY_BAKE_TEXTURES_MS = '0'; $fit8gb.VICTORY_SHADER_LOOP_LIMIT = '256'; Write-Host 'Tweaks: on (A/B)' }
 foreach ($k in $More.Keys) { $fit8gb[$k] = $More[$k] }
 if (-not $Resolution) { $Resolution = $presets[$Preset].Resolution }
 Write-Host "Preset: $Preset"
