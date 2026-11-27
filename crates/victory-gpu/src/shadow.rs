@@ -1575,6 +1575,12 @@ struct Workers {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    spin_for(most, there);
+}
+
+/// Waits awake until `there` says so, `most` microseconds at most (0: not at
+/// all).
+pub(crate) fn spin_for(most: u64, there: impl Fn() -> bool) {
     if most == 0 {
         return;
     }
@@ -1584,6 +1590,32 @@ fn spin(there: impl Fn() -> bool) {
             std::hint::spin_loop();
         }
     }
+}
+
+/// `VICTORY_WAIT_SPIN=<microseconds>` (0, the default: not at all): how long
+/// the thread that spread work over helpers ([`wide`], `crate::land`'s
+/// pools) waits awake for the last of it before it sleeps.
+///
+/// Why: that thread is the one a frame waits for (the submitting thread, 50
+/// to 54 ms of a 57 ms frame in session 2026-11-28 00:45). It does its own
+/// share, and then sleeps until a helper is done with its last piece, which
+/// is microseconds away more often than not; woken, it is not running for 50
+/// us and more (2 to 4 ms a frame of "woken, not running yet" on the frame's
+/// chain, timeline of 2026-11-27). `VICTORY_WIDE_SPIN` keeps the helpers awake
+/// too, after every job, on cores the title's threads want; this is the one
+/// waiting thread, for a bounded time, and only while helpers are at work.
+pub(crate) fn wait_spin() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = std::env::var("VICTORY_WAIT_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0u64).min(2000);
+        if most > 0 {
+            tracing::info!(
+                micros = most,
+                "the thread that spreads work over helpers waits awake for the last of it (VICTORY_WAIT_SPIN)"
+            );
+        }
+        most
+    })
 }
 
 /// How many threads are kept for [`wide`].
@@ -1641,13 +1673,18 @@ fn wide(jobs: Vec<Job>) {
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    // Jobs not done yet, for [`wait_spin`]: read without the lock the helpers
+    // take when they are done (the count under the lock is the one waited on).
+    let undone = Arc::new(std::sync::atomic::AtomicUsize::new(jobs.len()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
+            let undone = undone.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
                 job();
+                undone.fetch_sub(1, Ordering::Release);
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
@@ -1667,6 +1704,7 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    spin_for(wait_spin(), || undone.load(Ordering::Acquire) == 0);
     spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
@@ -1702,6 +1740,77 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
         })
         .collect();
     wide(jobs);
+}
+
+/// `VICTORY_WIDE_CHUNK=<n>` (1, the default: as before): a submission's
+/// refreshes of copies go to the kept threads `n` at a time, and a thread is
+/// woken for every `n` of them ([`wide_each_from`]).
+///
+/// Why: 9,584 refreshes a frame in 38 flushes, 8,438 of them known to copy
+/// nothing and 9,086 of them told so on the threads (session 2026-11-28
+/// 00:45): each took its number from one counter all the threads share, and
+/// a flush of a few small ones woke as many threads as it had pieces.
+pub(crate) fn wide_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        let chunk =
+            std::env::var("VICTORY_WIDE_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1usize).clamp(1, 256);
+        if chunk > 1 {
+            tracing::info!(chunk, "refreshes of copies go to the kept threads several at a time (VICTORY_WIDE_CHUNK)");
+        }
+        chunk
+    })
+}
+
+/// [`wide_each`] for many small pieces behind a few long ones: the numbers
+/// under `single` go one at a time (the long pieces: each may be a thread's
+/// whole share), the others `chunk` at a time, and no more threads take part
+/// than there are such shares. With `chunk` 1 it is [`wide_each`].
+pub(crate) fn wide_each_from(n: usize, single: usize, chunk: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    let (single, chunk) = (single.min(n), chunk.max(1));
+    if chunk == 1 {
+        return wide_each(n, work);
+    }
+    let threads = (wide_threads() + 1).min(shares(n, single, chunk));
+    if threads < 2 {
+        (0..n).for_each(work);
+        return;
+    }
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let work = Arc::new(work);
+    let jobs = (0..threads)
+        .map(|_| {
+            let (next, work) = (next.clone(), work.clone());
+            Box::new(move || {
+                while let Some((from, to)) = claim(&next, n, single, chunk) {
+                    (from..to).for_each(|i| work(i));
+                }
+            }) as Job
+        })
+        .collect();
+    wide(jobs);
+}
+
+/// How many shares [`claim`] cuts `n` numbers into.
+fn shares(n: usize, single: usize, chunk: usize) -> usize {
+    let single = single.min(n);
+    single + (n - single).div_ceil(chunk.max(1))
+}
+
+/// The next numbers under `n` for one thread, counted on in `next`: one while
+/// they are under `single`, then up to `chunk`. `None`: all are taken.
+fn claim(next: &std::sync::atomic::AtomicUsize, n: usize, single: usize, chunk: usize) -> Option<(usize, usize)> {
+    let mut from = next.load(Ordering::Relaxed);
+    loop {
+        if from >= n {
+            return None;
+        }
+        let to = if from < single { from + 1 } else { (from + chunk).min(n) };
+        match next.compare_exchange_weak(from, to, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some((from, to)),
+            Err(now) => from = now,
+        }
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -6213,4 +6322,43 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod wide_chunk_tests {
+    use super::{claim, shares, wide_each_from};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// The long pieces go one at a time, the others by the chunk, each
+    /// number once.
+    #[test]
+    fn numbers_are_claimed_once_each_the_single_ones_first() {
+        let next = AtomicUsize::new(0);
+        let mut got = Vec::new();
+        while let Some(range) = claim(&next, 23, 3, 8) {
+            got.push(range);
+        }
+        assert_eq!(got, [(0, 1), (1, 2), (2, 3), (3, 11), (11, 19), (19, 23)]);
+        assert_eq!(shares(23, 3, 8), 6);
+        // More single ones named than there are numbers.
+        assert_eq!(shares(2, 5, 8), 2);
+        assert_eq!(shares(0, 0, 8), 0);
+        assert_eq!(shares(7, 0, 8), 1);
+        assert!(claim(&AtomicUsize::new(0), 0, 0, 8).is_none());
+        assert_eq!(claim(&AtomicUsize::new(0), 2, 5, 8), Some((0, 1)));
+    }
+
+    /// Every number is worked once, whatever the chunk and however few.
+    #[test]
+    fn every_number_is_worked_once_whatever_the_chunk() {
+        for (n, single, chunk) in [(0, 0, 8), (1, 0, 8), (7, 0, 8), (100, 0, 8), (1000, 3, 16), (300, 300, 4), (257, 1, 1), (9, 2, 256)] {
+            let worked: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
+            let counted = worked.clone();
+            wide_each_from(n, single, chunk, move |i| {
+                counted[i].fetch_add(1, Ordering::Relaxed);
+            });
+            assert!(worked.iter().all(|w| w.load(Ordering::Relaxed) == 1), "n {n}, single {single}, chunk {chunk}");
+        }
+    }
 }
