@@ -6019,6 +6019,10 @@ impl Host {
         crate::copystat::submission_begins();
         #[cfg(feature = "diagnostics")]
         crate::profile::seen(crate::profile::Seen::Submit);
+        // `VICTORY_HEAP_ROUNDS_EARLY=1` (runkis 53d71710): the heaps' records
+        // begun now, beside the card steps and the wait for flights, not only
+        // at the ask below.
+        crate::descriptor::ask_sync_heaps_ahead();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
