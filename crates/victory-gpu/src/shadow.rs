@@ -5537,7 +5537,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
                     }
                 }
             }
-            crate::host::drop_later_any(Box::new(gone));
+            // Dropped here, after the lock: each drop frees a buffer in the driver.
+            drop(gone);
         }
     }
     // The buffer made without the lock: a system call, which every other
@@ -5566,7 +5567,19 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        // Another thread made this view's copy while the buffer was made
+        // without the lock: that one is kept, this one goes.
+        if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+            *used = now;
+            return Some(shadow.clone());
+        }
+        map.insert((address, len), (shadow.clone(), now));
+    }
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
