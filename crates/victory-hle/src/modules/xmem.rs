@@ -367,7 +367,7 @@ const LARGE_MARK: usize = usize::MAX;
 
 /// A block of `layout` of [`LARGE`] bytes or more as a reservation of its own
 /// below 2^40 that Windows watches for writes ([`XMemVirtualAlloc`]), not from
-/// the host heap (`VICTORY_XMEM_WATCHED=0`: from the heap, as before).
+/// the host heap (`VICTORY_XMEM_WATCHED=1`; off by default on the nvidia-4060 branch until measured).
 ///
 /// The heap gives such blocks their own memory, unwatched and above 2^40:
 /// a 21 MB buffer of the title's the card writes every frame was copied
@@ -378,7 +378,7 @@ fn large(layout: Layout) -> Option<*mut c_void> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if layout.size() < LARGE
         || layout.align() > 64 << 10
-        || !*ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_none_or(|v| v != "0"))
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_some_and(|v| v == "1"))
     {
         return None;
     }
@@ -2041,7 +2041,9 @@ mod tests {
         assert!(!big.is_null() && !small.is_null());
         assert_eq!(big as usize % 64, 0);
         assert_eq!(small as usize % 64, 0);
-        assert!((big as usize) < 1 << 40, "{big:?}");
+        if std::env::var_os("VICTORY_XMEM_WATCHED").is_some_and(|v| v == "1") {
+            assert!((big as usize) < 1 << 40, "{big:?}");
+        }
         // SAFETY: the blocks are this long.
         unsafe {
             std::ptr::write_bytes(big.cast::<u8>(), 7, 4 << 20);
