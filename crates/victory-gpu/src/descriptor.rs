@@ -283,6 +283,29 @@ fn early_line(frames: f64) {
     );
 }
 
+/// What the tables did (`VICTORY_TABLE_COUNTS=1`): made against copied
+/// views, the recordings a thread began its views anew for, and the mirrored
+/// entries read through against those left as read (`VICTORY_TABLE_CACHE=1`
+/// moves counts from the first of each pair). From runkis-nvidia 0548aeb6's
+/// draw-parts line.
+#[cfg(windows)]
+fn tables_line(frames: f64) {
+    use host::{LISTED, LISTED_BEGUN, LISTED_COPIED, LISTED_LEFT, LISTED_MADE, LISTED_READ};
+    if !host::table_counts() || frames <= 0.0 {
+        return;
+    }
+    let n: Vec<f64> = LISTED.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "tables per frame (VICTORY_TABLE_CACHE={}): views made {:.0}, copied {:.0}, recordings begun anew on a thread {:.0}; mirrored entries read {:.0}, left as read {:.0}",
+        u8::from(host::table_cache()),
+        n[LISTED_MADE],
+        n[LISTED_COPIED],
+        n[LISTED_BEGUN],
+        n[LISTED_READ],
+        n[LISTED_LEFT]
+    );
+}
+
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     if !sync_aside() {
@@ -622,6 +645,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     early_line(frames);
+    tables_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -2038,6 +2062,132 @@ mod tests {
             offset / 32 + 2,
             "the next allocation took the table's second slot"
         );
+    }
+
+    /// Mirrored table entries left as read at the same epoch of the list
+    /// (`VICTORY_TABLE_CACHE=1`, `State::entry_readable`) leave the list as
+    /// reading them again does. Fixed seeds; two title heaps alike, two
+    /// lists, the same draws: tables of buffer views at moving places,
+    /// records written again, the lists' epochs moved (as a texture's state
+    /// would move them). After each draw both lists have the same steps,
+    /// refreshed ranges and textures, and their host slots hold the same.
+    /// `cargo test --release -p victory-gpu --lib -- --ignored --nocapture
+    /// table_cache` times the tables part of such draws.
+    #[cfg(windows)]
+    #[test]
+    fn mirrored_entries_left_as_read_change_nothing() {
+        mirrored_entries(2_000, false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture"]
+    fn table_cache_mirrored_entries() {
+        mirrored_entries(20_000, true);
+    }
+
+    /// See [`mirrored_entries_left_as_read_change_nothing`]; `timed`: the
+    /// tables of each side timed instead of compared after every draw.
+    #[cfg(windows)]
+    fn mirrored_entries(draws: usize, timed: bool) {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        const SLOTS: u32 = 256;
+        const ENTRIES: u32 = 12;
+        let null = std::ptr::null();
+        let make_heap = || {
+            let desc = HeapDesc { kind: VIEWS_KIND, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 };
+            let mut h: This = std::ptr::null();
+            assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+            h
+        };
+        let (old_heap, new_heap) = (make_heap(), make_heap());
+        if heap(old_heap).host().is_none() || heap(new_heap).host().is_none() {
+            return;
+        }
+        let buffers: Vec<This> = (0..32).map(|_| crate::resource::test_buffer(4096)).collect();
+        let write = |slot: u32, b: usize, k: u32| {
+            let desc: [u32; 10] = [41, 1, 5768, 0, k * 16, 0, 16, 0, 0, 0];
+            for h in [old_heap, new_heap] {
+                create_srv(null, buffers[b], &desc, heap(h).handle(slot).expect("a slot"));
+            }
+        };
+        for slot in 0..SLOTS {
+            write(slot, slot as usize % buffers.len(), slot % 4);
+        }
+        let (old_list, new_list) = (device.new_list().expect("a host list"), device.new_list().expect("a host list"));
+        let (mut old, mut new) = (crate::draw::State::default(), crate::draw::State::default());
+        old.set_heaps(&[old_heap]);
+        new.set_heaps(&[new_heap]);
+        let used: Vec<UsedResource> = (0..ENTRIES)
+            .map(|e| UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: e * 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            })
+            .collect();
+        let mut seed = 0x007a_b1e5_u64;
+        let mut below = |n: u64| {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            seed.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        };
+        let mut times = [0f64; 2];
+        let scratch = [0u8; 16];
+        let _retiring = host::retiring();
+        for draw in 0..draws {
+            // Draws bind a few tables over and over, as the world's do.
+            let table = (below(6) * 24) as u32;
+            match below(32) {
+                0 => {
+                    old_list.changed_something();
+                    new_list.changed_something();
+                }
+                // A title write: what was refreshed is refreshed again after it.
+                2 => {
+                    for list in [&old_list, &new_list] {
+                        list.defer_copy(scratch.as_ptr().cast_mut(), scratch[8..].as_ptr(), 8);
+                    }
+                }
+                1 => write(below(u64::from(SLOTS)) as u32, below(buffers.len() as u64) as usize, below(4) as u32),
+                _ => {}
+            }
+            for (on, state, list, h) in [(false, &mut old, &old_list, old_heap), (true, &mut new, &new_list, new_heap)] {
+                state.set_table(true, 0, heap(h).handle(table).expect("a slot"));
+                host::TABLE_CACHE_TEST.set(Some(on));
+                let began = std::time::Instant::now();
+                let made = state.tables(list, &used, &[], &[], true);
+                times[usize::from(on)] += began.elapsed().as_secs_f64();
+                host::TABLE_CACHE_TEST.set(None);
+                assert!(made.is_empty(), "no table made afresh");
+            }
+            if !timed {
+                assert_eq!(old_list.read_census(), new_list.read_census(), "draw {draw}: what the lists read");
+                for slot in table..table + ENTRIES {
+                    let held = |h: This| heap(h).host().and_then(|host| host.kept_raw(slot));
+                    assert_eq!(held(old_heap), held(new_heap), "draw {draw}, slot {slot}");
+                }
+            }
+        }
+        assert!(new.entries_read() > 0 && old.entries_read() == 0, "the new side kept what it read");
+        assert!(!old_list.read_census().1.is_empty(), "the draws refreshed buffers");
+        if timed {
+            let [before, after] = times.map(|s| s * 1e6 / draws as f64);
+            eprintln!(
+                "mirrored tables of {ENTRIES} buffer views, {draws} draws: read through {before:.2} us a draw, left as read at the same epoch {after:.2} us a draw"
+            );
+        }
+        for h in [old_heap, new_heap] {
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        }
     }
 
     #[test]
