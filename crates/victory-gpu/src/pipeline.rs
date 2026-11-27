@@ -482,8 +482,9 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Shader hashes as printed in the pipeline diagnostics (`VICTORY_SKIP_PIPELINES`; honoured in every build, so
+/// a release build can keep the ray-tracing skip list).
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -503,7 +504,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -519,7 +520,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
