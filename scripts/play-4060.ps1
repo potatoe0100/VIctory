@@ -40,6 +40,10 @@ $presets = @{
 }
 $fit8gb = @{}
 foreach ($k in $presets[$Preset].Settings.Keys) { $fit8gb[$k] = $presets[$Preset].Settings[$k] }
+# Keyboard and mouse as on GTA V PC (upstream pull request 3345): F2 or ` locks mouse look, left click shoots,
+# right click aims; only while no controller is connected. -More @{VICTORY_KBM_GTA='0'} turns it off.
+# (Ctrl+Shift+Q ends the game in every layout.)
+$fit8gb.VICTORY_KBM_GTA = '1'
 if ($Tweaks) { $fit8gb.VICTORY_BAKE_TEXTURES_MS = '0'; $fit8gb.VICTORY_SHADER_LOOP_LIMIT = '256'; Write-Host 'Tweaks: on (A/B)' }
 foreach ($k in $More.Keys) { $fit8gb[$k] = $More[$k] }
 if (-not $Resolution) { $Resolution = $presets[$Preset].Resolution }
