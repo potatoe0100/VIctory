@@ -2374,7 +2374,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             let charged_filled = (5 + 519) * 128;
             // As one window ahead of its draws and one by one alike.
             for i in filled.len()..RECORDS as usize {
-                assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
+                // x 0: no groups run. y and z are 1 now that they are not read
+                // (one-dimensional, as on the console).
+                assert_eq!(out[i * 8..i * 8 + 3], [0, 1, 1], "unfilled slot {i} must come out empty");
                 assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
             }
             assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
