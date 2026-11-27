@@ -3378,7 +3378,7 @@ mod landed_tests {
         // back as `crate::draw::State::tables_done` does: once.
         let mut ran = |runs: &mut Vec<u32>| {
             for first in runs.drain(..) {
-                heap.release(first, RUN);
+                heap.release(heap.id(), first, RUN);
             }
         };
         assert!(past_lag(&mut flights, 64, &mut ran).is_empty());
@@ -3390,7 +3390,7 @@ mod landed_tests {
         assert!(past_lag(&mut flights, 64, &mut ran).is_empty());
         assert_eq!(heap.dynamic(RUN), None);
         for first in again {
-            heap.release(first, RUN);
+            heap.release(heap.id(), first, RUN);
         }
     }
 }
