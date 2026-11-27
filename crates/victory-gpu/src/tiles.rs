@@ -99,25 +99,114 @@ pub(crate) fn wanted() -> bool {
             tier,
             on,
             floor_kb = floor() >> 10,
+            all = all(),
+            max_dim = max_dim(),
             "host copies of title textures take the card's memory level by level (VICTORY_LEVELS_ON_DEMAND=1)"
         );
         on
     })
 }
 
-fn parse_floor(value: Option<&str>) -> u64 {
-    value
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(1 << 20, |kb| kb.max(64).saturating_mul(1024))
+/// `VICTORY_LEVELS_ALL=1`: any large 2D single-layer mipmapped texture the
+/// title fills may use reserved levels-on-demand allocation, even when all
+/// its guest pages are already committed (off by default).
+pub(crate) fn all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEVELS_ALL").is_some_and(|v| v == "1"))
 }
 
-/// The bytes from which a texture is made this way: a megabyte, or
-/// `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189: the levels not
-/// held are 1.9 MB a copy on some 1,600 copies; a 512x512 texture has six
-/// tiles at most, and most of the calls for nothing.)
+fn parse_max_dim(value: Option<&str>) -> Option<u32> {
+    let dim = value.and_then(|v| v.trim().parse::<u32>().ok())?;
+    (dim > 0).then(|| dim.max(64))
+}
+
+/// `VICTORY_LEVELS_MAX_DIM=<pixels>`: drops mip levels whose larger side
+/// exceeds `<pixels>` from on-demand tile allocation and staging detiling
+/// (minimum 64 px; unset or 0: off).
+pub(crate) fn max_dim() -> Option<u32> {
+    static MAX: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| parse_max_dim(std::env::var("VICTORY_LEVELS_MAX_DIM").ok().as_deref()))
+}
+
+/// `VICTORY_LEVELS_RECLAIM=1`: unmaps tiles of standard levels that are no
+/// longer held or card-written (`UpdateTileMappings` null) and retires those
+/// tile runs back to the pool once in-flight GPU work finishes (off by default).
+pub(crate) fn reclaim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEVELS_RECLAIM").is_some_and(|v| v == "1"))
+}
+
+/// Filters held mip bitmask `held` to levels with `max(w >> mip, h >> mip)
+/// <= max_dim`, always retaining held levels at or above `first_tail` (or
+/// the highest held mip when `held != 0` and none matched) so a held
+/// texture never ends up empty.
+pub(crate) fn cap_levels(
+    held: u32,
+    width: u64,
+    height: u32,
+    mips: usize,
+    first_tail: usize,
+    max_dim: Option<u32>,
+) -> u32 {
+    let Some(limit) = max_dim else {
+        return held;
+    };
+    if held == 0 || mips == 0 {
+        return held;
+    }
+    let count = mips.min(32);
+    let limit = u64::from(limit);
+    let mut kept = 0u32;
+    for mip in 0..count {
+        let bit = 1u32 << mip;
+        if held & bit == 0 {
+            continue;
+        }
+        let mw = (width >> mip).max(1);
+        let mh = (u64::from(height) >> mip).max(1);
+        if mip >= first_tail || (mw <= limit && mh <= limit) {
+            kept |= bit;
+        }
+    }
+    if kept == 0 {
+        let highest = 31 - held.leading_zeros();
+        kept = 1u32 << highest;
+    }
+    kept
+}
+
+fn parse_floor_for(value: Option<&str>, vram_budget: Option<u64>) -> u64 {
+    const SMALL_VRAM_CEILING: u64 = 9 << 30;
+    if let Some(kb) = value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        return kb.max(64).saturating_mul(1024);
+    }
+    if vram_budget.is_some_and(|budget| budget <= SMALL_VRAM_CEILING) {
+        256 << 10
+    } else {
+        1 << 20
+    }
+}
+
+/// The bytes from which a texture is made this way: a megabyte (or 256 KiB on
+/// `<= 9 GiB` GPUs), or `VICTORY_LEVELS_MIN_KB`. (The accounting of run 189:
+/// the levels not held are 1.9 MB a copy on some 1,600 copies; a 512x512
+/// texture has six tiles at most, and most of the calls for nothing.)
 pub(crate) fn floor() -> u64 {
+    static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let value = OVERRIDE
+        .get_or_init(|| std::env::var("VICTORY_LEVELS_MIN_KB").ok())
+        .as_deref();
+    if value.and_then(|v| v.trim().parse::<u64>().ok()).is_some() {
+        return parse_floor_for(value, None);
+    }
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
+    if let Some(&bytes) = BYTES.get() {
+        return bytes;
+    }
+    let Some([budget, ..]) = host().and_then(|h| h.video_memory()) else {
+        return parse_floor_for(None, None);
+    };
+    *BYTES.get_or_init(|| parse_floor_for(None, Some(budget)))
 }
 
 /// The bytes of the tiles given to textures now: the card's memory they
@@ -237,14 +326,44 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
     }
 }
 
+/// Tile runs detached from unmapped subresources, returned to `POOL` only when
+/// dropped after all in-flight GPU submissions using them finish.
+struct ReclaimedTiles {
+    runs: Vec<(usize, Vec<(u32, u32)>)>,
+    bytes: u64,
+}
+
+impl Drop for ReclaimedTiles {
+    fn drop(&mut self) {
+        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+        for (index, runs) in self.runs.drain(..) {
+            by_heap.entry(index).or_default().extend(runs);
+        }
+        for (index, runs) in by_heap {
+            give_back(index, &runs);
+        }
+        STATS[2].fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 /// What is given so far to one texture.
 struct Given {
-    /// Per level with tiles of its own: whether it has them.
-    levels: Vec<bool>,
-    /// Whether the small levels the card packs together have theirs.
-    packed: bool,
-    /// The runs taken: the heap's place, first tile, tiles.
-    runs: Vec<(usize, u32, u32)>,
+    /// Per level with tiles of its own: heap index and runs, if mapped.
+    levels: Vec<Option<(usize, Vec<(u32, u32)>)>>,
+    /// Small levels packed together: heap index and runs, if mapped.
+    packed: Option<(usize, Vec<(u32, u32)>)>,
+}
+
+#[cfg(test)]
+impl Given {
+    fn runs(&self) -> Vec<(usize, u32, u32)> {
+        self.levels
+            .iter()
+            .chain(std::iter::once(&self.packed))
+            .flatten()
+            .flat_map(|(index, runs)| runs.iter().map(move |&(start, count)| (*index, start, count)))
+            .collect()
+    }
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -325,9 +444,8 @@ impl Tiled {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         Some(Tiled {
             given: Mutex::new(Given {
-                levels: vec![false; standard.len()],
-                packed: false,
-                runs: Vec::new(),
+                levels: vec![None; standard.len()],
+                packed: None,
             }),
             standard,
             packed: packed_tiles,
@@ -378,7 +496,15 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let changed = self.give_locked(
+            &mut given,
+            queue,
+            device,
+            texture,
+            named,
+            if room { named } else { card },
+            reclaim(),
+        );
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -415,6 +541,7 @@ impl Tiled {
             texture,
             prev | levels | self.held.load(Ordering::Relaxed),
             levels,
+            false,
         );
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
@@ -474,7 +601,11 @@ impl Tiled {
         let first_packed = self.standard.len() as u32;
         let mut without = 0;
         for level in 0..self.levels.min(32) {
-            let has = if level < first_packed { given.levels[level as usize] } else { given.packed };
+            let has = if level < first_packed {
+                given.levels[level as usize].is_some()
+            } else {
+                given.packed.is_some()
+            };
             if !has {
                 without |= 1 << level;
             }
@@ -504,9 +635,10 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        self.give_locked(&mut given, queue, device, texture, named, may, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn give_locked(
         &self,
         given: &mut Given,
@@ -515,18 +647,69 @@ impl Tiled {
         texture: &ID3D12Resource,
         named: u32,
         may: u32,
+        reclaim_unheld: bool,
     ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
+        if reclaim_unheld {
+            let mut reclaimed = Vec::new();
+            let mut reclaimed_bytes = 0u64;
+            for level in 0..first_packed {
+                if !has(level)
+                    && let Some((index, runs)) = given.levels[level as usize].take()
+                {
+                    let tiles: u32 = runs.iter().map(|run| run.1).sum();
+                    if tiles > 0 {
+                        let at = D3D12_TILED_RESOURCE_COORDINATE {
+                            X: 0,
+                            Y: 0,
+                            Z: 0,
+                            Subresource: level,
+                        };
+                        let size = D3D12_TILE_REGION_SIZE {
+                            NumTiles: tiles,
+                            ..Default::default()
+                        };
+                        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+                        let began = std::time::Instant::now();
+                        // SAFETY: live reserved texture, unmapping one full subresource to NULL.
+                        unsafe {
+                            queue.UpdateTileMappings(
+                                texture,
+                                1,
+                                Some(&raw const at),
+                                Some(&raw const size),
+                                None,
+                                1,
+                                Some(&raw const flag),
+                                None,
+                                Some(&raw const tiles),
+                                D3D12_TILE_MAPPING_FLAG_NONE,
+                            );
+                        }
+                        STATS[6].fetch_add(1, Ordering::Relaxed);
+                        STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        reclaimed_bytes += u64::from(tiles) * TILE;
+                    }
+                    reclaimed.push((index, runs));
+                }
+            }
+            if !reclaimed.is_empty() {
+                crate::host::retire(ReclaimedTiles {
+                    runs: reclaimed,
+                    bytes: reclaimed_bytes,
+                });
+            }
+        }
         // (subresource, tiles, the level if it has tiles of its own) to map now.
         let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
         for level in 0..first_packed {
-            if !given.levels[level as usize] && now(level) {
+            if given.levels[level as usize].is_none() && now(level) {
                 wanted.push((level, self.standard[level as usize], Some(level as usize)));
             }
         }
-        if self.packed > 0 && !given.packed && (first_packed..self.levels).any(now) {
+        if self.packed > 0 && given.packed.is_none() && (first_packed..self.levels).any(now) {
             wanted.push((first_packed, self.packed, None));
         }
         for (subresource, tiles, level) in wanted {
@@ -570,20 +753,17 @@ impl Tiled {
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             match level {
-                Some(level) => given.levels[level] = true,
-                None => given.packed = true,
-            }
-            for &(start, count) in &runs {
-                given.runs.push((index, start, count));
+                Some(level) => given.levels[level] = Some((index, runs)),
+                None => given.packed = Some((index, runs)),
             }
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
         }
         let with_tiles = |level: u32| {
             if level < first_packed {
-                given.levels[level as usize]
+                given.levels[level as usize].is_some()
             } else {
-                given.packed
+                given.packed.is_some()
             }
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
@@ -603,8 +783,8 @@ impl Tiled {
     fn has_tiles(&self, level: u32) -> bool {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         match given.levels.get(level as usize) {
-            Some(&has) => has,
-            None => level < self.levels && given.packed,
+            Some(slot) => slot.is_some(),
+            None => level < self.levels && given.packed.is_some(),
         }
     }
 
@@ -612,7 +792,7 @@ impl Tiled {
     #[cfg(test)]
     fn whole(&self) -> bool {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.levels.iter().all(|&has| has) && (self.packed == 0 || given.packed)
+        given.levels.iter().all(Option::is_some) && (self.packed == 0 || given.packed.is_some())
     }
 
     /// A bit for every level of the texture.
@@ -623,7 +803,14 @@ impl Tiled {
     /// The bytes of the tiles it has now.
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
+        given
+            .levels
+            .iter()
+            .flatten()
+            .chain(given.packed.iter())
+            .flat_map(|(_, runs)| runs.iter())
+            .map(|run| u64::from(run.1) * TILE)
+            .sum()
     }
 }
 
@@ -632,9 +819,11 @@ impl Drop for Tiled {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
         let mut bytes = 0;
         let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
-        for &(index, start, tiles) in &given.runs {
-            by_heap.entry(index).or_default().push((start, tiles));
-            bytes += u64::from(tiles) * TILE;
+        for (index, runs) in given.levels.drain(..).flatten().chain(given.packed.take()) {
+            for &(start, tiles) in &runs {
+                bytes += u64::from(tiles) * TILE;
+                by_heap.entry(index).or_default().push((start, tiles));
+            }
         }
         for (index, runs) in by_heap {
             give_back(index, &runs);
@@ -648,13 +837,13 @@ impl Drop for Tiled {
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
 /// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
+/// remaining levels). `ResourceMinLODClamp` is measured from mip 0 of the
+/// resource, so moving the start of the view preserves that field.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
     if first >= levels {
         return;
     }
-    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
+    let clamp = |most: &mut u32, mips: &mut u32| {
         if first <= *most {
             return;
         }
@@ -663,20 +852,17 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
         }
-        if *min_lod > 0.0 {
-            *min_lod = (*min_lod - fewer as f32).max(0.0);
-        }
     };
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: `ViewDimension` selects `Texture2D`.
             let view = unsafe { &mut desc.Anonymous.Texture2D };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: `ViewDimension` selects `Texture2DArray`.
             let view = unsafe { &mut desc.Anonymous.Texture2DArray };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
         }
         _ => {}
     }
@@ -1223,12 +1409,12 @@ void look() {
         let upload = rig.filled(&layout, |_| 0xa5);
         let read = rig.round_trip(&first, &layout, Some(&upload));
         assert!(all(&read[level as usize], 0xa5));
-        let runs = first_tiles.given.lock().unwrap().runs.clone();
+        let runs = first_tiles.given.lock().unwrap().runs();
         drop(first_tiles);
         drop(first);
         let (second, second_tiles) = rig.reserved(&desc);
         rig.give(&second_tiles, &second, 1 << level);
-        let reused = second_tiles.given.lock().unwrap().runs == runs;
+        let reused = second_tiles.given.lock().unwrap().runs() == runs;
         let unwritten = rig.round_trip(&second, &layout, None);
         eprintln!(
             "a level given tiles and not written reads {:?} (its tiles are the first texture's: {reused})",
@@ -1255,7 +1441,7 @@ void look() {
         // Level 1 of a 1024 texture: four tiles.
         assert!(tiled.standard.len() > 1 && tiled.standard[1] >= 2);
         rig.give(&tiled, &texture, 1 << 1);
-        let runs = tiled.given.lock().unwrap().runs.len();
+        let runs = tiled.given.lock().unwrap().runs().len();
         eprintln!("level 1 ({} tiles) was mapped on {runs} ranges", tiled.standard[1]);
         assert!(runs >= 2, "the single free tiles were not used first");
         let upload = rig.filled(&layout, |_| 0x77);
@@ -1264,10 +1450,10 @@ void look() {
         give_back(singles[1].1, &singles[1].2);
     }
 
-    /// (v) A view made by [`show_from`] of a texture whose level 0 has no
-    /// tiles returns level 1's colour for a sample at level 0; the view as
-    /// the title asked returns zero.
-    fn the_view_starts_at_the_first_level_with_tiles(rig: &mut Rig) -> Option<()> {
+    /// (v) Sample LOD 0 through the adjusted and original views. Level 0
+    /// has no tiles. A minimum LOD inside the resident range should select
+    /// the same resource level through either view.
+    fn sample_resident_views(rig: &mut Rig, min_lod: f32) -> Option<[u32; 2]> {
         rig.step = "step 5, the view from the first level with tiles";
         let cs = compile(LOOK, s!("look"), s!("cs_5_1")).ok()?;
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1313,7 +1499,7 @@ void look() {
                         MostDetailedMip: 0,
                         MipLevels: u32::MAX,
                         PlaneSlice: 0,
-                        ResourceMinLODClamp: 0.0,
+                        ResourceMinLODClamp: min_lod,
                     },
                 },
             };
@@ -1355,14 +1541,12 @@ void look() {
             let mut data = std::ptr::null_mut();
             let range = D3D12_RANGE { Begin: 0, End: 16 };
             back.Map(0, Some(&range), Some(&mut data)).unwrap();
-            let read = std::slice::from_raw_parts(data.cast::<u32>(), 2).to_vec();
+            let read = data.cast::<[u32; 2]>().read();
             back.Unmap(0, None);
             read
         };
-        eprintln!("a sample at level 0: {} through the view from level 1, {} through the view as asked", read[0], read[1]);
-        assert_eq!(read[0], 32, "the view from the first level with tiles reads level 1");
-        assert_eq!(read[1], 0, "the view from level 0 reads a level without tiles");
-        Some(())
+        eprintln!("sample at LOD 0, minimum {min_lod}: adjusted and original {read:?}");
+        Some(read)
     }
 
     fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {
@@ -1451,8 +1635,12 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
-        if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
-            eprintln!("the view test's shader or objects could not be made; that part was skipped");
+        for (min_lod, expected) in [(0.0, [32, 0]), (3.0, [64, 64])] {
+            let Some(read) = sample_resident_views(&mut rig, min_lod) else {
+                eprintln!("the view test's shader or objects could not be made; that part was skipped");
+                break;
+            };
+            assert_eq!(read, expected, "resource minimum LOD {min_lod}");
         }
         rig.step = "the end";
         rig.check("every step done");
@@ -1473,15 +1661,15 @@ void look() {
 
     #[test]
     fn floor_saturates_instead_of_wrapping() {
-        assert_eq!(parse_floor(None), 1 << 20);
-        assert_eq!(parse_floor(Some("0")), 64 << 10);
-        assert_eq!(parse_floor(Some("2048")), 2048 << 10);
-        assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
-        assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
+        assert_eq!(parse_floor_for(None, None), 1 << 20);
+        assert_eq!(parse_floor_for(Some("0"), None), 64 << 10);
+        assert_eq!(parse_floor_for(Some("2048"), None), 2048 << 10);
+        assert_eq!(parse_floor_for(Some(&(1u64 << 54).to_string()), None), u64::MAX);
+        assert_eq!(parse_floor_for(Some(&u64::MAX.to_string()), None), u64::MAX);
     }
 
     #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_from_preserves_resource_min_lod_for_2d_and_2d_array() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1501,7 +1689,7 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1523,7 +1711,7 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        assert_eq!(varr.ResourceMinLODClamp, 1.5);
     }
 
     #[test]
@@ -1561,9 +1749,8 @@ void look() {
             levels: 2,
             full: TILE,
             given: Mutex::new(Given {
-                levels: vec![false, false],
-                packed: false,
-                runs: Vec::new(),
+                levels: vec![None, None],
+                packed: None,
             }),
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
@@ -1583,5 +1770,103 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn max_dim_parses_and_floors_at_64() {
+        assert_eq!(parse_max_dim(None), None);
+        assert_eq!(parse_max_dim(Some("")), None);
+        assert_eq!(parse_max_dim(Some("0")), None);
+        assert_eq!(parse_max_dim(Some("nope")), None);
+        assert_eq!(parse_max_dim(Some("16")), Some(64));
+        assert_eq!(parse_max_dim(Some(" 1024 ")), Some(1024));
+    }
+
+    #[test]
+    fn cap_levels_drops_oversized_mips_but_keeps_tail_and_fallback() {
+        let full = |n: usize| -> u32 { (1u32 << n) - 1 };
+        // Off: keeps all bits untouched.
+        assert_eq!(cap_levels(full(13), 4096, 4096, 13, 9, None), full(13));
+        // 4096x4096 with 1024 cap drops mips 0 (4096) and 1 (2048).
+        assert_eq!(cap_levels(full(13), 4096, 4096, 13, 9, Some(1024)), full(13) & !0b11);
+        // Non-square 2048x1024 with 1024 cap drops only mip 0 (max(2048, 1024) > 1024).
+        assert_eq!(cap_levels(full(12), 2048, 1024, 12, 8, Some(1024)), full(12) & !0b1);
+        // Texture already within cap stays unchanged.
+        assert_eq!(cap_levels(full(10), 512, 512, 10, 6, Some(1024)), full(10));
+        // Single-mip oversized held texture falls back cleanly instead of becoming 0.
+        assert_eq!(cap_levels(1 << 0, 2048, 2048, 2, 1, Some(1024)), 1 << 0);
+        // Packed tail is always preserved even if held alone.
+        assert_eq!(cap_levels(0b11 << 8, 4096, 4096, 10, 8, Some(64)), 0b11 << 8);
+        // Unheld stays 0.
+        assert_eq!(cap_levels(0, 4096, 4096, 13, 9, Some(1024)), 0);
+    }
+
+    #[test]
+    fn reclaim_unmaps_unheld_standard_levels_and_keeps_card_and_packed() {
+        let Some(host) = host() else {
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 512,
+            Height: 512,
+            DepthOrArraySize: 1,
+            MipLevels: 10,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: plain reserved resource on the host device.
+        unsafe {
+            host.device
+                .CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut tex)
+                .unwrap();
+        }
+        let tex = tex.unwrap();
+        let tiled = Tiled::make(&host.device, &tex, 10).unwrap();
+        let every = tiled.every_level();
+        // Map every level.
+        {
+            let mut given = tiled.given.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(tiled.give_locked(&mut given, host.queue(), &host.device, &tex, every, every, false));
+        }
+        assert_eq!(tiled.first_shown(), Some(0));
+        let full_bytes = tiled.given_bytes();
+        assert!(full_bytes > 0);
+        // Mark level 1 as card-written, then shrink held to levels 2..10 and reclaim.
+        tiled.card.store(1 << 1, Ordering::Relaxed);
+        let kept_held = every & !0b11;
+        {
+            let mut given = tiled.given.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = tiled.give_locked(
+                &mut given,
+                host.queue(),
+                &host.device,
+                &tex,
+                kept_held | (1 << 1),
+                kept_held | (1 << 1),
+                true,
+            );
+            assert!(changed);
+        }
+        assert!(!tiled.has_tiles(0), "unheld standard level 0 must be reclaimed");
+        assert!(tiled.has_tiles(1), "card-written level 1 must be retained");
+        assert!(tiled.has_tiles(2), "held level 2 must be retained");
+        assert!(tiled.has_tiles(9), "packed tail must be retained");
+        assert_eq!(tiled.first_shown(), Some(1));
+        assert!(tiled.given_bytes() < full_bytes);
+    }
+
+    #[test]
+    fn floor_scales_under_9_gib_and_respects_override() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(parse_floor_for(None, Some(8 * GIB)), 256 << 10);
+        assert_eq!(parse_floor_for(None, Some(9 * GIB)), 256 << 10);
+        assert_eq!(parse_floor_for(None, Some(12 * GIB)), 1 << 20);
+        assert_eq!(parse_floor_for(None, None), 1 << 20);
+        assert_eq!(parse_floor_for(Some("512"), Some(8 * GIB)), 512 << 10);
+        assert_eq!(parse_floor_for(Some("16"), Some(16 * GIB)), 64 << 10);
     }
 }

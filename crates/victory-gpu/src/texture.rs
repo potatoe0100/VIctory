@@ -485,6 +485,11 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// The bytes of staging buffers alive ([`crate::residency`]).
+pub(crate) fn live_staging_bytes() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1151,7 +1156,14 @@ impl Staging {
                 }
             }
         }
-        held
+        crate::tiles::cap_levels(
+            held,
+            u64::from(self.layout.desc.width),
+            self.layout.desc.height,
+            mips.len(),
+            tail,
+            crate::tiles::max_dim(),
+        )
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -1857,6 +1869,15 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
+            // (`VICTORY_RESIDENCY=1`: no buffer of its own for a texture
+            // picked by index while commit is short; it stays due.)
+            let speculative = PICKING.get().is_some() && !BAKING.get();
+            if crate::residency::upload_refused()
+                || (speculative && !crate::residency::allow_staging_growth(false))
+            {
+                crate::residency::note_staging_deferred();
+                return None;
+            }
             let (buffer, data) = host.upload_buffer(total)?;
             crate::host::name(&buffer, || {
                 format!(
@@ -2120,7 +2141,7 @@ mod allocation_costs {
                 seen.push(digest(&bytes));
             }
         }
-        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
         for at in 0..399 {
             let mut bytes = text.clone();
             bytes.swap(at, at + 1);

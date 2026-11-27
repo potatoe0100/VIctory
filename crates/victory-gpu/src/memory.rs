@@ -84,7 +84,7 @@ const PAGE: u64 = 1 << 16;
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
 const PIECE: usize = 4096;
-/// Pages held, at most (3 GiB).
+/// Pages held, at most (3 GiB on > 9 GiB GPUs).
 const MOST: usize = 3 << 14;
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
@@ -92,8 +92,63 @@ const WINDOWS: usize = 512;
 const PACKED: u64 = 64 << 20;
 /// For so many frames what a page holds may still be on its way.
 const YOUNG: u64 = 4;
-/// Free pages there are, at least, when a list is recorded.
+/// Free pages there are, at least, when a list is recorded on > 9 GiB GPUs.
 const SPARE: usize = 1024;
+
+/// Maximum resident address-indexed RT/BVH pages for `vram_budget` and
+/// optional `VICTORY_RT_MEMORY_MB` override (clamped to `256..=3072` MiB).
+fn most_pages_for(vram_budget: Option<u64>, override_mb: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    const PAGES_PER_MIB: u64 = (1 << 20) / PAGE;
+    if let Some(mb) = override_mb {
+        return (mb.clamp(256, 3072) * PAGES_PER_MIB) as usize;
+    }
+    match vram_budget {
+        Some(budget) if budget <= 6 * GIB => (512 * PAGES_PER_MIB) as usize,
+        Some(budget) if budget <= 9 * GIB => (1024 * PAGES_PER_MIB) as usize,
+        _ => MOST,
+    }
+}
+
+/// Minimum spare address-indexed pages kept ahead when building BVHs.
+fn spare_pages_for(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match vram_budget {
+        Some(budget) if budget <= 9 * GIB => 256,
+        _ => SPARE,
+    }
+}
+
+fn most_pages() -> usize {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
+        std::env::var("VICTORY_RT_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if override_mb.is_some() {
+        return most_pages_for(None, override_mb);
+    }
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&pages) = PAGES.get() {
+        return pages;
+    }
+    let Some([budget, ..]) = host().and_then(|h| h.video_memory()) else {
+        return MOST;
+    };
+    *PAGES.get_or_init(|| most_pages_for(Some(budget), None))
+}
+
+fn spare_pages() -> usize {
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&pages) = PAGES.get() {
+        return pages;
+    }
+    let Some([budget, ..]) = host().and_then(|h| h.video_memory()) else {
+        return SPARE;
+    };
+    *PAGES.get_or_init(|| spare_pages_for(Some(budget)))
+}
 /// A packed structure not named for so many frames is another one.
 const AGAIN: u64 = 8;
 /// From a root view; from one that is written (a structure being built).
@@ -369,9 +424,10 @@ impl Memory {
             }
             return false;
         }
-        if self.pages.len() >= MOST {
+        let most = most_pages();
+        if self.pages.len() >= most {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            ONCE.call_once(|| tracing::warn!(most, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
         if let Some((copy, at)) = self.free.pop() {
@@ -926,7 +982,9 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    let spare = spare_pages();
+    let most = most_pages();
+    while builds && m.free.len() < spare && m.pages.len() + m.free.len() < most && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1300,5 +1358,21 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn rt_memory_caps_scale_with_vram_and_override() {
+        const GIB: u64 = 1 << 30;
+        const PAGES_PER_MIB: usize = ((1 << 20) / PAGE) as usize;
+        assert_eq!(most_pages_for(Some(6 * GIB), None), 512 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(8 * GIB), None), 1024 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(16 * GIB), None), MOST);
+        assert_eq!(most_pages_for(None, None), MOST);
+        assert_eq!(most_pages_for(Some(8 * GIB), Some(1536)), 1536 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(8 * GIB), Some(64)), 256 * PAGES_PER_MIB);
+        assert_eq!(most_pages_for(Some(16 * GIB), Some(8192)), 3072 * PAGES_PER_MIB);
+        assert_eq!(spare_pages_for(Some(8 * GIB)), 256);
+        assert_eq!(spare_pages_for(Some(16 * GIB)), SPARE);
+        assert_eq!(spare_pages_for(None), SPARE);
     }
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! What the indirect executions of a list ran, for the report of a removed
 //! device: with `VICTORY_D3D12_DRED=light` the lists carry no markers, and
 //! the two device losses of 2026-11-25 (sessions play-1125-0203 and n02)

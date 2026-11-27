@@ -227,11 +227,27 @@ extern "system" fn create_queue(
     )
 }
 
-/// The title asks for 32 MiB and stops if this fails.
+fn staging_bytes_for(requested: u32, override_mb: Option<u64>) -> u64 {
+    let floor = override_mb.map_or(0, |mb| mb.clamp(32, 256) << 20);
+    u64::from(requested).max(floor)
+}
+
+fn staging_floor_mb() -> Option<u64> {
+    static FLOOR: OnceLock<Option<u64>> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// The title asks for 32 MiB and stops if this fails; `VICTORY_DSTORAGE_STAGING_MB`
+/// raises the floor (`32..=256` MiB) so cutscene and scene transitions overlap more reads.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    let effective = staging_bytes_for(size, staging_floor_mb());
+    tracing::info!(size, effective, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = effective;
     }
     S_OK
 }
@@ -430,7 +446,7 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     /// Read at a time.
     const MOST: usize = 1 << 20;
     let sector = SECTOR as u64;
-    if offset % sector == 0 && out.len() % SECTOR == 0 && out.as_ptr() as usize % SECTOR == 0 {
+    if offset.is_multiple_of(sector) && out.len().is_multiple_of(SECTOR) && (out.as_ptr() as usize).is_multiple_of(SECTOR) {
         return read_overlapped(file, out, offset);
     }
     thread_local! {
@@ -604,7 +620,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: staging_bytes_for(STAGING as u32, staging_floor_mb()),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -2137,7 +2153,7 @@ mod tests {
         for round in 0..2 {
             for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
                 let file = Files::open_for_test(&path, mode);
-                let at: Vec<u64> = (0..READS).map(|_| random() % (len - SIZE as u64) & !15).collect();
+                let at: Vec<u64> = (0..READS).map(|_| (random() % (len - SIZE as u64)) & !15).collect();
                 for pass in ["cold", "again"] {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let busy = AtomicU64::new(0);
@@ -2542,5 +2558,14 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn staging_floor_raises_but_clamps_budget() {
+        assert_eq!(staging_bytes_for(32 << 20, None), 32 << 20);
+        assert_eq!(staging_bytes_for(32 << 20, Some(64)), 64 << 20);
+        assert_eq!(staging_bytes_for(32 << 20, Some(8)), 32 << 20);
+        assert_eq!(staging_bytes_for(32 << 20, Some(1024)), 256 << 20);
+        assert_eq!(staging_bytes_for(128 << 20, Some(64)), 128 << 20);
     }
 }

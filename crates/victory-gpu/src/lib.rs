@@ -19,6 +19,8 @@
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod census;
 pub mod console;
 // LOCAL (port of fxceless #1189): Series S interface plane laid over the game (VICTORY_COMPOSE=1).
 #[cfg(windows)]
@@ -61,6 +63,8 @@ pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -95,6 +99,8 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use census::title_memory_reserved;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

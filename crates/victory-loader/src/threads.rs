@@ -107,27 +107,29 @@ extern "C" fn detach_all() {
     // needs the heap and the log writer's lock.
     // Its thread id, set when it runs its own code; 0 until then.
     static WATCHDOG: AtomicU32 = AtomicU32::new(0);
-    drop(std::thread::spawn(|| {
+    let watchdog = std::thread::Builder::new().spawn(|| {
         // SAFETY: a plain query of the calling thread.
         let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         WATCHDOG.store(id, Ordering::SeqCst);
         std::thread::sleep(DETACH_DEADLINE);
         end_process();
-    }));
-    // Its start (loader notices, Rust's thread set-up) is done only when
-    // it runs its own code. The loader notices need the loader lock. This
-    // thread can hold it, or a thread that waits for this thread can hold
-    // it. Then the watchdog does not start, so this wait has the same
-    // deadline.
-    let waiting = Instant::now();
-    let watchdog = loop {
-        match WATCHDOG.load(Ordering::SeqCst) {
-            0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
-            0 => std::thread::yield_now(),
-            id => break id,
-        }
-    };
-    end_other_threads(&[watchdog]);
+    });
+    // Under x86_64-pc-windows-gnu, MinGW's CRT runs atexit after ExitProcess
+    // begins, when CreateThread refuses new threads. If spawning fails, detach
+    // proceeds without a watchdog deadline rather than panicking across extern "C".
+    if watchdog.is_ok() {
+        let waiting = Instant::now();
+        let id = loop {
+            match WATCHDOG.load(Ordering::SeqCst) {
+                0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
+                0 => std::thread::yield_now(),
+                id => break id,
+            }
+        };
+        end_other_threads(&[id]);
+    } else {
+        end_other_threads(&[]);
+    }
     for image in dlls.iter().chain(&exes) {
         // SAFETY: attached images are bound. A non-null third argument
         // tells the entry points the process is ending.

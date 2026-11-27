@@ -203,12 +203,16 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    pub(crate) fn tables_done(&mut self) {
+        self._state.tables_done();
+    }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and the `now_ms()` timestamp when it was parked.
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -234,6 +238,49 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// Maximum idle host command lists kept for reuse, defaulting to `512` or
+/// overridden via `VICTORY_LIST_POOL_MOST` (`16..=1024`). Under host RAM
+/// pressure, [`trim_idle_lists`] prunes excess entries down to 64.
+#[cfg(windows)]
+fn idle_list_most_for(_limited_ram: bool, override_count: Option<usize>) -> usize {
+    if let Some(count) = override_count {
+        return count.clamp(16, 1024);
+    }
+    IDLE_MOST.0
+}
+
+/// Optional idle expiry TTL in milliseconds (`VICTORY_LIST_POOL_IDLE_S`, `0`
+/// or unset disables TTL; capped at 600 s).
+#[cfg(windows)]
+fn idle_list_ttl_ms_for(_limited_ram: bool, override_s: Option<u64>) -> Option<u64> {
+    match override_s {
+        Some(0) | None => None,
+        Some(s) => Some(s.min(600) * 1000),
+    }
+}
+
+#[cfg(windows)]
+fn idle_list_most() -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let ov = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    });
+    idle_list_most_for(crate::residency::limited_host_ram(), ov)
+}
+
+#[cfg(windows)]
+fn idle_list_ttl_ms() -> Option<u64> {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let ov = *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_IDLE_S")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    idle_list_ttl_ms_for(crate::residency::limited_host_ram(), ov)
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -249,15 +296,41 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
+}
+
+/// Releases aged or excess idle command lists outside the pool mutex so D3D12
+/// allocator teardown never stalls active list recording.
+#[cfg(windows)]
+pub(crate) fn trim_idle_lists(now_ms: u64, pressured: bool) {
+    let ttl = idle_list_ttl_ms();
+    if !pressured && ttl.is_none() {
+        return;
+    }
+    let min_keep = if pressured { 64 } else { 32 };
+    let mut dropped = Vec::new();
+    {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        while idle.0.len() > min_keep {
+            let expired = ttl.is_some_and(|ms| now_ms.saturating_sub(idle.0[0].2) >= ms);
+            if pressured || expired {
+                let removed = idle.0.remove(0);
+                idle.1 = idle.1.saturating_sub(removed.1);
+                dropped.push(removed);
+            } else {
+                break;
+            }
+        }
+    }
+    drop(dropped);
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -269,11 +342,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let most = idle_list_most();
+    let now_ms = crate::host::now_ms();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -281,8 +356,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
+            idle.0.push(Idle(host, bytes, now_ms));
             idle.1 += bytes;
         }
     }
@@ -2441,5 +2516,18 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn idle_list_bounds_scale_for_limited_ram_and_overrides() {
+        assert_eq!(idle_list_most_for(false, None), 512);
+        assert_eq!(idle_list_most_for(true, None), 512);
+        assert_eq!(idle_list_most_for(true, Some(4)), 16);
+        assert_eq!(idle_list_most_for(false, Some(4096)), 1024);
+        assert_eq!(idle_list_ttl_ms_for(false, None), None);
+        assert_eq!(idle_list_ttl_ms_for(true, None), None);
+        assert_eq!(idle_list_ttl_ms_for(true, Some(0)), None);
+        assert_eq!(idle_list_ttl_ms_for(false, Some(30)), Some(30_000));
+        assert_eq!(idle_list_ttl_ms_for(false, Some(1200)), Some(600_000));
     }
 }

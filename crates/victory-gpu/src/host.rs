@@ -368,7 +368,11 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    let effective = match (avail_phys, crate::residency::headroom()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -432,6 +436,12 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    crate::residency::refresh();
+    crate::list::trim_idle_lists(now, crate::residency::pressured());
+    if crate::residency::pressured() {
+        trim_spare_chunks();
+        crate::shadow::trim_snapshot_pool();
+    }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -484,7 +494,30 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 /// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
-    *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+    *LAG.get_or_init(|| {
+        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
+        std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    })
+}
+
+/// `VICTORY_RELAY_FLUSH_TABLES=1`: return landed flights' dynamic descriptor
+/// tables immediately upon GPU completion instead of waiting behind `bury_lag`.
+fn relay_flush_tables() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_FLUSH_TABLES").is_some_and(|v| v == "1"))
+}
+
+fn tables_back(landed: &mut [(Vec<crate::list::Detached>, Vec<usize>)]) {
+    if !relay_flush_tables() {
+        return;
+    }
+    for (lists, order) in landed {
+        for &i in order.iter() {
+            if let Some(list) = lists.get_mut(i) {
+                list.tables_done();
+            }
+        }
+    }
 }
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
@@ -1963,7 +1996,12 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+                    SPARE_KEPT
+                } else {
+                    SPARE_MOST
+                };
+                spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
             };
@@ -1981,6 +2019,26 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         }
     }
     // Freed outside the lock.
+    drop(freed);
+}
+
+/// Lets go of scratch chunks kept idle when host memory is pressured
+/// (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
+fn trim_spare_chunks() {
+    let freed: Vec<(Chunk, u64)> = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.kept.is_empty() {
+            return;
+        }
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    let count = freed.len() as u64;
+    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
 }
 
@@ -2658,6 +2716,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -2884,7 +2943,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -4007,6 +4066,7 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        crate::census::made(8, 0);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4250,10 +4310,19 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
-        let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
+        let mut declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
+        // Experiment (`VICTORY_SKIP_WC_COMPARE=1`): copies of write-combining
+        // title memory are left out of the hashing and the compare; nothing
+        // of them is fetched back. Pending ranges are still closed by the
+        // flights' own declared writes (`declared_writes`).
+        if crate::census::skip_wc_compare() {
+            let before = declared.len();
+            declared.retain(|(_, ranges)| !crate::census::all_wc(ranges));
+            crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
+        }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -4328,6 +4397,7 @@ impl Host {
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        crate::census::sent(shadow.title_start(), bytes, ranges.len() as u64);
                         #[cfg(feature = "diagnostics")]
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
@@ -4635,7 +4705,10 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && !seen.contains(&(copy, lo, hi)) {
+                        if lo < hi
+                            && !seen.contains(&(copy, lo, hi))
+                            && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                        {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                 land::count(land::stat::HAD, 1);
@@ -4653,6 +4726,7 @@ impl Host {
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                    crate::census::compared(r.shadow.title_start(), u64::from(r.span.pieces));
                 }
             }
         }
@@ -4771,6 +4845,11 @@ impl Host {
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            if crate::census::on() {
+                for (shadow, lo, hi, _) in &pieces {
+                    crate::census::fetched(shadow.title_start(), (hi - lo) as u64);
+                }
+            }
         }
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
@@ -4932,6 +5011,7 @@ impl Host {
                 }
             };
         }
+        tables_back(&mut landed);
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
@@ -5011,12 +5091,16 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+            crate::census::compared(r.shadow.title_start(), u64::from(r.span.pieces));
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
@@ -5060,6 +5144,11 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if crate::census::on() {
+                    for &(i, lo, hi, _) in &pieces {
+                        crate::census::fetched(plan.ranges[i].shadow.title_start(), (hi - lo) as u64);
+                    }
+                }
             }
             if wide_merge() && pieces.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
@@ -5392,6 +5481,7 @@ impl Host {
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
                 }
             }
+            tables_back(&mut landed);
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
                 bury(last);
@@ -7659,6 +7749,7 @@ enum Touch {
     /// The copy is given to shaders.
     Write(usize),
     /// Title memory is written.
+    #[allow(dead_code)]
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -8438,6 +8529,7 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        crate::census::made(0, size);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8477,6 +8569,7 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        crate::census::made(1, size);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -8524,6 +8617,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -8732,15 +8826,16 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
             }
-            if crate::resource::held_only() {
+            if crate::resource::held_only() || crate::resource::texture_mip_drop() > 0 {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                 let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "textures from the first level viewed (VICTORY_HELD_LEVELS=0: whole), since the start: {copies} host copies of the \
+                    "textures from the first level viewed (VICTORY_HELD_LEVELS=0: whole; VICTORY_TEXTURE_MIP_DROP={}), since the start: {copies} host copies of the \
                      levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
                      {flipped} slots made from their new view after its upload had run ({missed} written again first); {} uploads left \
                      out as the host copy held those bytes (VICTORY_TEXTURE_SAME=0: made); {} MB of texture blocks free; \
                      {} looks for textures to let go, {:.2} ms each, the longest {:.1}",
+                    crate::resource::texture_mip_drop(),
                     bytes >> 20,
                     whole >> 20,
                     crate::draw::HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
@@ -8880,6 +8975,7 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
+    #[allow(dead_code)]
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         self.present_over(texture, state, None, frame)
     }
@@ -9227,6 +9323,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        crate::census::made(2, size);
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9370,6 +9467,7 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        crate::census::made(3, size);
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {

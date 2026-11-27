@@ -22,6 +22,7 @@ const ALLOWED_NAMES: &[&str] = &[
     ".gitattributes",
     ".editorconfig",
     ".victory-root",
+    "CODEOWNERS",
     "pre-commit",
     "LICENSE",
     "LICENSE-MIT",
