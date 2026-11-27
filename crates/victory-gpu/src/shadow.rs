@@ -5509,7 +5509,7 @@ mod window_tests {
 
     /// `scripts/play-4060.ps1`'s presets: name and MiB of card buffer copies
     /// (keep in step with the script).
-    const PRESETS_4060: [(&str, u64); 3] = [("balanced", 768), ("safe", 512), ("fast", 896)];
+    const PRESETS_4060: [(&str, u64); 3] = [("balanced", 1024), ("safe", 512), ("fast", 1536)];
 
     /// Each of `scripts/play-4060.ps1`'s presets: its card buffer copies, the
     /// room kept for render targets (`targets_room_kept_bytes`) and the texture

@@ -2,8 +2,8 @@
 #   scripts\play-4060.ps1 -Exe <path of your own copy's executable> [-Resolution 480|540|720] [-Quality] [-NoSmoothMotion]
 #
 # This is scripts\play-nvidia.ps1 (Series S, 540p, ray tracing mostly off) with settings that fit 8 GB:
-# - VICTORY_CARD_BUFFERS_MB 768 instead of 1536. The 1536 MB figure was measured on a 12 GB RTX 5070; on an 8 GB
-#   card the system's video memory budget is about 7.5 GB, and past it Windows moves the card's memory into the PC's
+# - Card buffer copies (VICTORY_CARD_BUFFERS_MB) are set by the preset below, not the 1536 MB play-nvidia.ps1 uses
+#   everywhere: on an 8 GB card the budget is about 7.2 GB, and past it Windows moves the card's memory into the PC's
 #   (much slower, and what ended the fork's runs 20 and 24).
 # - On PCs with under 24 GB of RAM, play-nvidia.ps1 puts up to 3072 MB of title memory windows in the card's memory
 #   (VICTORY_WINDOWS_BAR_MB). That is sized for 12 GB+ cards: on 8 GB, 3072 + 3072 kept for render targets + 768 of
@@ -13,8 +13,8 @@
 # Presets (-Preset; the numbers are also in shadow.rs `PRESETS_4060`, whose test checks they fit the card's budget,
 # and with 1 GB less free, e.g. a browser open):
 #   safe      480p, 512 MB of card buffer copies, levels on demand (least video memory)
-#   balanced  540p, 768 MB (the default)
-#   fast      480p, 896 MB (most frames a second; the most buffer copies that still fit with 1 GB less free)
+#   balanced  540p, 1024 MB (the default)
+#   fast      540p, 1536 MB (the fork's own figure: more memory compares on the card, more frames a second)
 # -Resolution overrides the preset's resolution.
 # -Tweaks: two settings to compare against a run without them (A/B; not known to help yet):
 #   VICTORY_BAKE_TEXTURES_MS=0 (no wait for textures before the title's decoration bake draws) and
@@ -33,8 +33,8 @@ param(
 )
 $presets = @{
     safe     = @{ Resolution = '480'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '512'; VICTORY_LEVELS_ON_DEMAND = '1' } }
-    balanced = @{ Resolution = '540'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '768' } }
-    fast     = @{ Resolution = '480'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '896' } }
+    balanced = @{ Resolution = '540'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '1024' } }
+    fast     = @{ Resolution = '540'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '1536' } }
 }
 $fit8gb = @{}
 foreach ($k in $presets[$Preset].Settings.Keys) { $fit8gb[$k] = $presets[$Preset].Settings[$k] }
