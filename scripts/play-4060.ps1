@@ -10,9 +10,16 @@
 #   buffer copies is past the textures' line (about 6.5 GB). Here it is 1536 instead (-WindowsBarMB N to change).
 #   PCs with 24 GB or more keep it off, as in play-nvidia.ps1.
 # - Everything else (texture budget, room kept for render targets) already scales with the budget Windows reports.
+# Presets (-Preset; the numbers are also in shadow.rs `PRESETS_4060`, whose test checks they fit the card's budget,
+# and with 1 GB less free, e.g. a browser open):
+#   safe      480p, 512 MB of card buffer copies, levels on demand (least video memory)
+#   balanced  540p, 768 MB (the default)
+#   fast      480p, 896 MB (most frames a second; the most buffer copies that still fit with 1 GB less free)
+# -Resolution overrides the preset's resolution.
 # Extra settings can still be passed: -More @{VICTORY_CARD_BUFFERS_MB='512'}
 param(
     [Parameter(Mandatory)][string]$Exe,
+    [ValidateSet('safe', 'balanced', 'fast')][string]$Preset = 'balanced',
     [ValidateSet('1080', '720', '540', '480')][string]$Resolution,
     [switch]$Quality,
     [switch]$NoSmoothMotion,
@@ -20,12 +27,17 @@ param(
     [hashtable]$More = @{},
     [uint32]$WindowsBarMB
 )
-$fit8gb = @{
-    VICTORY_CARD_BUFFERS_MB = '768'
+$presets = @{
+    safe     = @{ Resolution = '480'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '512'; VICTORY_LEVELS_ON_DEMAND = '1' } }
+    balanced = @{ Resolution = '540'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '768' } }
+    fast     = @{ Resolution = '480'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '896' } }
 }
+$fit8gb = @{}
+foreach ($k in $presets[$Preset].Settings.Keys) { $fit8gb[$k] = $presets[$Preset].Settings[$k] }
 foreach ($k in $More.Keys) { $fit8gb[$k] = $More[$k] }
-$splat = @{ Exe = $Exe; More = $fit8gb; Build = $Build; Quality = $Quality; NoSmoothMotion = $NoSmoothMotion }
-if ($Resolution) { $splat.Resolution = $Resolution }
+if (-not $Resolution) { $Resolution = $presets[$Preset].Resolution }
+Write-Host "Preset: $Preset"
+$splat = @{ Exe = $Exe; More = $fit8gb; Build = $Build; Quality = $Quality; NoSmoothMotion = $NoSmoothMotion; Resolution = $Resolution }
 if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
     $splat.WindowsBarMB = $WindowsBarMB
 } else {

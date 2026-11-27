@@ -5453,32 +5453,46 @@ mod window_tests {
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
     }
 
-    /// `scripts/play-4060.ps1`'s card buffer copies (768 MiB), the room kept
-    /// for render targets (3,072 MiB by default) and the texture floor fit
-    /// under the textures' line (90 %) of the budget this machine's card
-    /// reports; printed, so a run on an 8 GB card shows its numbers.
+    /// `scripts/play-4060.ps1`'s presets: name and MiB of card buffer copies
+    /// (keep in step with the script).
+    const PRESETS_4060: [(&str, u64); 3] = [("balanced", 768), ("safe", 512), ("fast", 896)];
+
+    /// Each of `scripts/play-4060.ps1`'s presets: its card buffer copies, the
+    /// room kept for render targets (3,072 MiB by default) and the texture
+    /// floor fit under the textures' line (90 %) of the budget this machine's
+    /// card reports, and of that budget less 1 GiB (another program, such as
+    /// a browser, holding some of the card); printed, so a run on an 8 GB card
+    /// shows its numbers.
     #[test]
     fn the_8gb_launcher_settings_fit_the_reported_budget() {
         const MIB: u64 = 1 << 20;
-        let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        let Some([reported, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
             eprintln!("no host device; skipped");
             return;
         };
-        let (_, card) = resolve_card_limits(Some(budget), None, Some(768));
-        let targets = 3072 * MIB;
-        let floor = (2u64 << 30).min(budget / 4);
-        let line = budget / 100 * 90;
-        eprintln!(
-            "video memory budget {} MiB (in use {} MiB); card buffers {} + render targets {} + texture floor {} = {} MiB, line {} MiB",
-            budget / MIB,
-            used / MIB,
-            card / MIB,
-            targets / MIB,
-            floor / MIB,
-            (card + targets + floor) / MIB,
-            line / MIB
-        );
-        assert!(card + targets + floor < line, "the 8 GB settings do not fit this card's budget");
+        let mut misfits = Vec::new();
+        for (name, mb) in PRESETS_4060 {
+            for (what, budget) in [("", reported), (", 1 GiB less free", reported.saturating_sub(1 << 30))] {
+                let (_, card) = resolve_card_limits(Some(budget), None, Some(mb));
+                let targets = 3072 * MIB;
+                let floor = (2u64 << 30).min(budget / 4);
+                let line = budget / 100 * 90;
+                eprintln!(
+                    "video memory budget {} MiB{what} (in use {} MiB), preset {name}: card buffers {} + render targets {} + texture floor {} = {} MiB, line {} MiB",
+                    budget / MIB,
+                    used / MIB,
+                    card / MIB,
+                    targets / MIB,
+                    floor / MIB,
+                    (card + targets + floor) / MIB,
+                    line / MIB
+                );
+                if card + targets + floor >= line {
+                    misfits.push(format!("{name}{what}"));
+                }
+            }
+        }
+        assert!(misfits.is_empty(), "the 8 GB presets do not fit this card's budget: {misfits:?}");
     }
 
     /// An ask that may take any window takes the longest that holds all of

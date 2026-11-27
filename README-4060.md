@@ -28,7 +28,9 @@ cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play-4060.ps1 -Exe <path of your copy's executable>
 ```
 
-Options: `-Resolution 480` (faster, softer) or `-Resolution 720` (sharper, slower); `-Quality` (fewer stretched
+Presets: `-Preset safe` (480p, least video memory), `-Preset balanced` (540p, the default) or `-Preset fast`
+(480p, more buffer copies on the card). Each is checked to fit an 8 GB card's budget, also with 1 GB of it taken by
+other programs. Other options: `-Resolution 480` (faster, softer) or `-Resolution 720` (sharper, slower); `-Quality` (fewer stretched
 bodies, slower); `-NoSmoothMotion`. If video memory runs out, try
 `-More @{VICTORY_LEVELS_ON_DEMAND='1'}`: textures take memory only for the levels the game holds. Its test passes on
 an RTX 4060, but it hasn't been tried in the game on this branch.
