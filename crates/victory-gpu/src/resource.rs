@@ -1805,7 +1805,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// Defaults to 3,072 MiB on >=12 GiB cards, scaled to at most `budget / 4`
 /// on cards with `<= 9 GiB` VRAM unless `VICTORY_CARD_ROOM_FOR_TARGETS_MB` is set.
 #[cfg(any(windows, test))]
-fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Option<u64>) -> u64 {
+pub(crate) fn targets_room_kept_bytes(vram_budget: Option<u64>, override_mb: Option<u64>) -> u64 {
     const DEFAULT_MOST: u64 = 3072 << 20;
     const SMALL_BUDGET_CEILING: u64 = 9 << 30;
     if let Some(mb) = override_mb {

@@ -5512,7 +5512,7 @@ mod window_tests {
     const PRESETS_4060: [(&str, u64); 3] = [("balanced", 768), ("safe", 512), ("fast", 896)];
 
     /// Each of `scripts/play-4060.ps1`'s presets: its card buffer copies, the
-    /// room kept for render targets (3,072 MiB by default) and the texture
+    /// room kept for render targets (`targets_room_kept_bytes`) and the texture
     /// floor fit under the textures' line (90 %) of the budget this machine's
     /// card reports, and of that budget less 1 GiB (another program, such as
     /// a browser, holding some of the card); printed, so a run on an 8 GB card
@@ -5528,7 +5528,7 @@ mod window_tests {
         for (name, mb) in PRESETS_4060 {
             for (what, budget) in [("", reported), (", 1 GiB less free", reported.saturating_sub(1 << 30))] {
                 let (_, card) = resolve_card_limits(Some(budget), None, Some(mb));
-                let targets = 3072 * MIB;
+                let targets = crate::resource::targets_room_kept_bytes(Some(budget), None);
                 let floor = (2u64 << 30).min(budget / 4);
                 let line = budget / 100 * 90;
                 eprintln!(
