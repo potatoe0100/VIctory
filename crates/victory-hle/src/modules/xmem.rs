@@ -1287,6 +1287,16 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
 /// Pages changed under the locks at once.
 const GROUP: usize = 64;
 
+/// Whether [`change`] passes over pages asked to show what they show
+/// already (`VICTORY_MAP_SAME=0`: no).
+fn map_same_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_SAME").is_none_or(|v| v != "0"))
+}
+
+/// Pages passed over by [`change`] since the start ([`map_same_skip`]).
+pub(crate) static MAP_SAME: AtomicU64 = AtomicU64::new(0);
+
 /// How many threads map a group of pages side by side (`VICTORY_MAP_THREADS`;
 /// 8 unless set; 1: the caller alone, a page after the other; `auto`: 1 while
 /// mapping takes little of the time, [`WIDE`] while the title streams as fast
@@ -1372,10 +1382,11 @@ impl Drop for Busy {
             static SAID: AtomicU64 = AtomicU64::new(0);
             if asked_threads().is_none() && SAID.fetch_add(1, Ordering::Relaxed) < 200 {
                 tracing::info!(
-                    "title pages are mapped by {} (VICTORY_MAP_THREADS): {:.0} ms of the last {:.0} ms went into mapping calls",
+                    "title pages are mapped by {} (VICTORY_MAP_THREADS): {:.0} ms of the last {:.0} ms went into mapping calls; pages asked to show what they showed already, passed over so far: {}",
                     if is { "several threads" } else { "the caller alone" },
                     all as f64 / 1e6,
-                    window.as_secs_f64() * 1e3
+                    window.as_secs_f64() * 1e3,
+                    MAP_SAME.load(Ordering::Relaxed)
                 );
             }
         }
@@ -1424,6 +1435,24 @@ impl Op {
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+    // A page asked to show what it shows already (same section, same page
+    // of it, a view of that page alone): nothing to unmap or map. Mapping
+    // it again would also make it read-write, losing the write guards on
+    // it, and every such pair of calls queues for the kernel's lock with
+    // the guards' protection changes (the title's main thread spent ~32% of
+    // its time in mapping calls, profiles belobug-11/12).
+    // `VICTORY_MAP_SAME=0`: mapped again, as before.
+    if map_same_skip() {
+        let before = ops.len();
+        ops.retain(|op| {
+            let Some(want) = &op.slice else { return true };
+            !matches!(physical.views.get(&op.at), Some((PAGE, have)) if Arc::ptr_eq(&have.section, &want.section) && have.index == want.index)
+        });
+        MAP_SAME.fetch_add((before - ops.len()) as u64, Ordering::Relaxed);
+        if ops.is_empty() {
+            return true;
+        }
+    }
     for op in &mut ops {
         let there = physical
             .views
@@ -2243,6 +2272,21 @@ mod tests {
                 assert_eq!(first(N + N / 2 + k).read(), first(k).read());
                 first(N + k).write(5);
                 assert_eq!(first(k).read(), 5);
+            }
+        }
+        // The same mappings asked for again: nothing to change, the pages
+        // are passed over (when mapped side by side) and still alias.
+        let same_before = MAP_SAME.load(Ordering::Relaxed);
+        assert!(map_aliases(&[(to, from, half)]));
+        if side_by_side() > 1 {
+            assert!(MAP_SAME.load(Ordering::Relaxed) >= same_before + (N / 2) as u64);
+        }
+        for k in 0..N / 2 {
+            // SAFETY: mapped read-write.
+            unsafe {
+                assert_eq!(first(N + k).read(), first(k).read());
+                first(N + k).write(9);
+                assert_eq!(first(k).read(), 9);
             }
         }
         // An address twice: the last one counts; page 0 unmaps.
