@@ -11,7 +11,7 @@
 # -Adapter         on a PC with more than one card, the one to use: part of its name (-Adapter 5060) or its index
 #                  (-Adapter '#1'). Default: Windows' default card (the one the main display is on).
 # -Build           target\diag (the default, the build all measurements are of) or target\release
-#                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
+#                  (on the nvidia-4060 branch the release build also honours the ray-tracing skip list)
 # -WindowsBarMB    maximum MiB of title memory windows in CPU-mapped VRAM (by default 3072 on PCs with under
 #                  24 GB of RAM, else 0; -WindowsBarMB 0 turns it off).
 # -More            other settings: -More @{VICTORY_PANEL='1'}
