@@ -1634,6 +1634,16 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     there == of
 }
 
+/// How many bytes from `at` on (of at most `len`) are committed memory that
+/// can be read, in whole kernel pages: the run up to the first page that
+/// is not there.
+pub(crate) fn committed_run(at: *const u8, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    readable(at as usize, len, true).0 * 4096
+}
+
 /// Whether the two questions above and below are put to `VirtualQuery`, as
 /// they were (`VICTORY_COMMITTED_QUERY=1`). `VirtualQuery` answers with the
 /// length of the run of pages in the same state, which it finds by walking

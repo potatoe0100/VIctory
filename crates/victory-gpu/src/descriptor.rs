@@ -217,6 +217,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            // (The submitting thread waits for its rounds.)
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -245,6 +247,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -1441,6 +1444,76 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
+/// Local fix (2026-11-26): the title's descriptions carry padding it never
+/// sets (stack bytes: values like 0x3e66e1bc or 0x7ffd that differ from call
+/// to call): the resource description's words 1 (before the 64-bit
+/// alignment) and 13 (after the flags), the shader view's word 3 (before its
+/// 64-bit-aligned union), and the words of the union its dimension leaves
+/// unused. Views are kept by every word ([`Views`]), so the same view written
+/// twice was two views: a run of 50 minutes kept 4,194,304 shapes of placed
+/// views (all there is room for) after 18 minutes, then 28.8 million table
+/// entries (11 GB) that are never let go, and the PC ran out of memory.
+/// These words are zeroed (the host reads none of them). `VICTORY_VIEW_TIDY=0`
+/// keeps them as the title wrote them.
+fn tidy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_TIDY").is_none_or(|v| v != "0"))
+}
+
+/// Zeroes the padding of a resource description in the host's layout
+/// (`D3D12_RESOURCE_DESC`, 56 bytes).
+fn tidy_resource(resource: &mut [u32; 14]) {
+    if tidy() {
+        resource[1] = 0;
+        resource[13] = 0;
+    }
+}
+
+/// Zeroes the words of a view description in the host's layout
+/// (`D3D12_SHADER_RESOURCE_VIEW_DESC` or `D3D12_UNORDERED_ACCESS_VIEW_DESC`,
+/// 40 bytes) that its dimension does not use: padding, and what the union
+/// holds past its member.
+fn tidy_view(unordered: bool, desc: &mut [u32]) {
+    if !tidy() || desc.len() < 10 {
+        return;
+    }
+    // The first word past what the dimension's member uses.
+    let end = if unordered {
+        // Format, dimension, then the union from word 2.
+        match desc[1] {
+            1 => 9,     // buffer: first element (2 words), count, stride, counter offset (2), flags
+            2 => 3,     // 1D: mip
+            3 => 5,     // 1D array: mip, first slice, slices
+            4 => 4,     // 2D: mip, plane
+            5 => 6,     // 2D array: mip, first slice, slices, plane
+            6 => 2,     // 2D multisampled: nothing
+            7 => 4,     // 2D multisampled array: first slice, slices
+            8 => 5,     // 3D: mip, first depth slice, depth slices
+            _ => return, // unknown or Xbox-only: as written
+        }
+    } else {
+        // Format, dimension, component mapping, padding, then the union
+        // from word 4.
+        desc[3] = 0;
+        match desc[1] {
+            1 => 9,      // buffer: first element (2 words), count, stride, flags
+            2 => 7,      // 1D: top mip, mips, LOD clamp
+            3 => 9,      // 1D array: top mip, mips, first slice, slices, LOD clamp
+            4 => 8,      // 2D: top mip, mips, plane, LOD clamp
+            5 => 10,     // 2D array: all six
+            6 => 4,      // 2D multisampled: nothing
+            7 => 6,      // 2D multisampled array: first slice, slices
+            8 | 9 => 7,  // 3D, cube: top mip, mips, LOD clamp
+            10 => 9,     // cube array: top mip, mips, first face, cubes, LOD clamp
+            11 => 6,     // ray-tracing structure: its address (2 words)
+            _ => return,
+        }
+    };
+    for w in &mut desc[end..10] {
+        *w = 0;
+    }
+}
+
 /// Device method.
 ///
 /// A null `desc` writes a null CBV (`Constant(0, 0)`), as D3D12's
@@ -1464,7 +1537,11 @@ pub(crate) extern "system" fn create_srv(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    record(handle, View::Shader(resource as usize, words(desc)));
+    let mut desc = words(desc);
+    if let Some(d) = desc.as_mut() {
+        tidy_view(false, d);
+    }
+    record(handle, View::Shader(resource as usize, desc));
 }
 
 /// Device method.
@@ -1475,7 +1552,11 @@ pub(crate) extern "system" fn create_uav(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    let view = View::Unordered(resource as usize, counter as usize, words(desc));
+    let mut desc = words(desc);
+    if let Some(d) = desc.as_mut() {
+        tidy_view(true, d);
+    }
+    let view = View::Unordered(resource as usize, counter as usize, desc);
     record(handle, view);
 }
 
@@ -1488,7 +1569,9 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
+        tidy_resource(&mut resource);
+        tidy_view(false, &mut desc[..10]);
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1499,7 +1582,9 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
+        tidy_resource(&mut resource);
+        tidy_view(true, &mut desc[..10]);
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1702,6 +1787,44 @@ static FUNCTIONS: Table<24> = {
     f[10] = start as *const (); // 0x50 GPU
     Table(f)
 };
+
+#[cfg(test)]
+mod tidy_tests {
+    use super::*;
+
+    /// Padding the title leaves as stack bytes is zeroed; what the view
+    /// uses is kept, so two writes of one view are one shape.
+    #[test]
+    fn padding_is_zeroed_and_used_words_kept() {
+        // A buffer shader view with garbage in words 3 and 9.
+        let mut a = [39, 1, 0x1688, 0x0e3f_8d00, 0, 0, 200, 0, 1, 0x3ea8_0210];
+        let mut b = [39, 1, 0x1688, 0x0000_000f, 0, 0, 200, 0, 1, 0x0000_0009];
+        tidy_view(false, &mut a);
+        tidy_view(false, &mut b);
+        assert_eq!(a, [39, 1, 0x1688, 0, 0, 0, 200, 0, 1, 0]);
+        assert_eq!(a, b);
+        // A 2D array shader view uses the whole union.
+        let mut arr = [28, 5, 0x1688, 7, 1, 2, 3, 4, 5, 6];
+        tidy_view(false, &mut arr);
+        assert_eq!(arr, [28, 5, 0x1688, 0, 1, 2, 3, 4, 5, 6]);
+        // A 2D shader view: words 8 and 9 are past its member.
+        let mut t = [28, 4, 0x1688, 0, 0, 9, 0, 0, 0xdead, 0xbeef];
+        tidy_view(false, &mut t);
+        assert_eq!(t, [28, 4, 0x1688, 0, 0, 9, 0, 0, 0, 0]);
+        // An unordered buffer view: no padding before the union, word 9 after.
+        let mut u = [42, 1, 0, 0, 0x116e, 0, 0, 0, 0, 0x18f];
+        tidy_view(true, &mut u);
+        assert_eq!(u, [42, 1, 0, 0, 0x116e, 0, 0, 0, 0, 0]);
+        // An unknown dimension is left as written (but for the shader view's word 3).
+        let mut x = [1, 0x40, 2, 3, 4, 5, 6, 7, 8, 9];
+        tidy_view(true, &mut x);
+        assert_eq!(x, [1, 0x40, 2, 3, 4, 5, 6, 7, 8, 9]);
+        // The resource description's two padding words.
+        let mut r = [1, 0x3e66_e1bc, 0, 0, 0x320, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0x3f6a_dbf6];
+        tidy_resource(&mut r);
+        assert_eq!(r, [1, 0, 0, 0, 0x320, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2017,8 +2140,12 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        // Padding is zeroed when recorded ([`tidy`]): expect the tidied words.
+        tidy_resource(&mut resource);
+        tidy_view(false, &mut desc[..10]);
+        tidy_view(true, &mut desc[..10]);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
             View::Placed(_, r, _) => *r == resource,

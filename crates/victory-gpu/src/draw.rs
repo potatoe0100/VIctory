@@ -857,7 +857,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = if srv { crate::shadow::find_reaching(address) } else { crate::shadow::find(address, 1) }?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -2004,7 +2004,7 @@ impl State {
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                let shadow = address.and_then(|a| crate::shadow::find_reaching(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };

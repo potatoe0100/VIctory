@@ -395,6 +395,15 @@ pub fn run(
 
 /// Every shader found into the cache runs translate from.
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    // As `translate --warm`: the host the cache is for (its key holds these), so a run on a card
+    // of 32-lane waves and a capped view heap (NVIDIA: `VICTORY_HOST_WAVE=32`,
+    // `VICTORY_VIEW_LIMIT=999999`) finds what this wrote.
+    if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_view_heap_limit(n);
+    }
+    if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
