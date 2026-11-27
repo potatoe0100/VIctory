@@ -334,6 +334,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    if let Some(block) = large(layout) {
+        return block;
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -355,6 +358,43 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
+/// Blocks of this many bytes and more are reservations of their own
+/// ([`large`]).
+const LARGE: usize = 2 << 20;
+
+/// What a large block's header holds where a heap block's holds its size.
+const LARGE_MARK: usize = usize::MAX;
+
+/// A block of `layout` of [`LARGE`] bytes or more as a reservation of its own
+/// below 2^40 that Windows watches for writes ([`XMemVirtualAlloc`]), not from
+/// the host heap (`VICTORY_XMEM_WATCHED=0`: from the heap, as before).
+///
+/// The heap gives such blocks their own memory, unwatched and above 2^40:
+/// a 21 MB buffer of the title's the card writes every frame was copied
+/// whole into its host copy and sent up whole at every refresh, 2.9-3.3 ms
+/// a frame, as nothing could say it had not changed. Its header holds
+/// [`LARGE_MARK`] and the reservation's base, for [`XMemFreeDefault`].
+fn large(layout: Layout) -> Option<*mut c_void> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if layout.size() < LARGE
+        || layout.align() > 64 << 10
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_none_or(|v| v != "0"))
+    {
+        return None;
+    }
+    let lead = layout.align().max(HEADER);
+    let base = XMemVirtualAlloc(std::ptr::null_mut(), layout.size() + lead, MEM_RESERVE | MEM_COMMIT, 0, PAGE_READWRITE);
+    if base.is_null() {
+        return None;
+    }
+    // SAFETY: the reservation holds `lead` bytes, then `size`.
+    unsafe {
+        let user = base.cast::<u8>().add(lead);
+        user.sub(HEADER).cast::<[usize; 2]>().write([LARGE_MARK, base as usize]);
+        Some(user.cast())
+    }
+}
+
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
@@ -369,6 +409,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if size == LARGE_MARK {
+            VirtualFree(align as *mut c_void, 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -1986,6 +2030,26 @@ pub(crate) fn module() -> HleModule {
 
 #[cfg(test)]
 mod tests {
+
+    /// A large block is a watched reservation below 2^40 of its own; a small
+    /// one comes from the heap; both are freed by the default free.
+    #[test]
+    fn large_default_blocks_are_watched_reservations() {
+        let attributes = 6u64 << ALIGNMENT_SHIFT; // 64-byte alignment
+        let big = XMemAllocDefault(4 << 20, attributes);
+        let small = XMemAllocDefault(4096, attributes);
+        assert!(!big.is_null() && !small.is_null());
+        assert_eq!(big as usize % 64, 0);
+        assert_eq!(small as usize % 64, 0);
+        assert!((big as usize) < 1 << 40, "{big:?}");
+        // SAFETY: the blocks are this long.
+        unsafe {
+            std::ptr::write_bytes(big.cast::<u8>(), 7, 4 << 20);
+            std::ptr::write_bytes(small.cast::<u8>(), 7, 4096);
+        }
+        XMemFreeDefault(big, attributes);
+        XMemFreeDefault(small, attributes);
+    }
     use super::*;
 
     fn query(address: *const c_void) -> BasicInformation {
