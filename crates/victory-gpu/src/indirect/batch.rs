@@ -100,8 +100,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 record[2] = 0;
             }
             asked = record[0];
-            record[1] = min(record[1], 1u);
-            record[2] = min(record[2], 1u);
+            // One-dimensional, as on the console: y and z are not read
+            // (titles leave them 0, which ran the dispatch empty).
+            record[1] = 1u;
+            record[2] = 1u;
             cost = record[0] * record[1] * record[2] * 128u;
         }
         cost *= job.x >> 16;

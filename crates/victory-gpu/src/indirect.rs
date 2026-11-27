@@ -136,7 +136,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             g = uint3(0, 0, 0);
         }
         asked = g.x;
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        // y and z are not read: the console runs x groups whatever they
+        // hold (as `dispatch_mesh` does), and titles leave them 0.
+        g = uint3(min(g.x, 65535u), 1u, 1u);
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }

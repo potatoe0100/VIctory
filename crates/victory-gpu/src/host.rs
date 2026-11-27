@@ -2663,16 +2663,32 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
-fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
-    let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
+fn flagged_pieces(flags: impl Iterator<Item = (usize, u32, bool)>) -> Vec<(usize, u32)> {
+    let mut pieces: Vec<_> = flags
+        .filter_map(|(copy, piece, wanted)| wanted.then_some((copy, piece)))
+        .collect();
     pieces.sort_unstable();
     pieces.dedup();
     pieces
 }
 
+/// Indices within one range, in the same order as scanning its pieces.
+fn flagged_in_range(
+    pieces: &[(usize, u32)],
+    copy: usize,
+    first: u32,
+    count: u32,
+) -> impl Iterator<Item = u32> + '_ {
+    let start = pieces.partition_point(|&key| key < (copy, first));
+    pieces[start..]
+        .iter()
+        .take_while(move |&&(owner, piece)| owner == copy && piece - first < count)
+        .map(move |&(_, piece)| piece - first)
+}
+
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_in_range, flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2702,7 +2718,7 @@ mod relay_tests {
         // Copy a: piece 3 under two ranges, flagged under the first only;
         // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
         let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
-        let fetch = flagged_pieces(&flags);
+        let fetch = flagged_pieces(flags.into_iter());
         assert!(fetch.contains(&(a, 3)));
         assert!(!fetch.contains(&(a, 4)));
         assert!(!fetch.contains(&(b, 3)));
@@ -2746,6 +2762,39 @@ mod relay_tests {
             }
         }
         assert!(fetch_parts_of(&[], &[], 4).is_empty());
+    }
+
+    #[test]
+    fn visiting_flagged_pieces_matches_scanning_each_range() {
+        let flags = [
+            (2, 5, true),
+            (1, 34, true),
+            (1, 2, true),
+            (1, 7, false),
+            (1, 34, false),
+            (1, 8, true),
+            (1, 34, true),
+            (1, 6, true),
+            (2, u32::MAX, true),
+        ];
+        let fetch = flagged_pieces(flags.into_iter());
+        for (copy, first, count) in [
+            (0, 0, 40),
+            (1, 0, 40),
+            (1, 6, 29),
+            (1, 8, 26),
+            (1, 34, 0),
+            (1, 35, 2),
+            (2, 4, 3),
+            (2, u32::MAX - 1, 2),
+            (3, 0, 40),
+        ] {
+            let scanned: Vec<_> = (0..count)
+                .filter(|&p| fetch.binary_search(&(copy, first + p)).is_ok())
+                .collect();
+            let selected: Vec<_> = flagged_in_range(&fetch, copy, first, count).collect();
+            assert_eq!(selected, scanned);
+        }
     }
 }
 
@@ -4908,7 +4957,7 @@ impl Host {
             let mut seen = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
+                let flags = plan
                     .ranges
                     .iter()
                     .filter(|r| !r.picked)
@@ -4918,18 +4967,14 @@ impl Host {
                             let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
                             (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
                         })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
+                    });
+                let fetched = flagged_pieces(flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
-                    for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
-                            continue;
-                        }
+                    for p in flagged_in_range(&fetched, copy, r.span.first, r.span.pieces) {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi
                             && !seen.contains(&(copy, lo, hi))
@@ -4969,7 +5014,15 @@ impl Host {
         {
             static LEAST: OnceLock<u64> = OnceLock::new();
             let least = *LEAST.get_or_init(|| {
-                std::env::var("VICTORY_LAND_NOT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |mb| mb << 20)
+                // `VICTORY_LAND_NOT_KB` says it finer and goes first
+                // (ReZOnGithub ddb3914c: 64 KB, 21.6 fps at the boat against
+                // 20.7 with 1 MB, the picture and the map the same down to
+                // 16 KB). Not 0: with nothing brought down the picture goes
+                // white.
+                let of = |name: &str, shift: u32| {
+                    std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|n| n << shift)
+                };
+                of("VICTORY_LAND_NOT_KB", 10).or_else(|| of("VICTORY_LAND_NOT_MB", 20)).unwrap_or(u64::MAX)
             });
             if least != u64::MAX {
                 pieces.retain(|p| p.0.span().1 < least);
