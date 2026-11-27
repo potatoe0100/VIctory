@@ -1288,10 +1288,10 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
 const GROUP: usize = 64;
 
 /// Whether [`change`] passes over pages asked to show what they show
-/// already (`VICTORY_MAP_SAME=0`: no).
+/// already (`VICTORY_MAP_SAME=1`; off by default on the nvidia-4060 branch until measured).
 fn map_same_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_SAME").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_SAME").is_some_and(|v| v == "1"))
 }
 
 /// Pages passed over by [`change`] since the start ([`map_same_skip`]).
@@ -1441,7 +1441,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     // it, and every such pair of calls queues for the kernel's lock with
     // the guards' protection changes (the title's main thread spent ~32% of
     // its time in mapping calls, profiles belobug-11/12).
-    // `VICTORY_MAP_SAME=0`: mapped again, as before.
+    // `VICTORY_MAP_SAME=1` turns this on (off by default here).
     if map_same_skip() {
         let before = ops.len();
         ops.retain(|op| {
@@ -2278,7 +2278,7 @@ mod tests {
         // are passed over (when mapped side by side) and still alias.
         let same_before = MAP_SAME.load(Ordering::Relaxed);
         assert!(map_aliases(&[(to, from, half)]));
-        if side_by_side() > 1 {
+        if side_by_side() > 1 && map_same_skip() {
             assert!(MAP_SAME.load(Ordering::Relaxed) >= same_before + (N / 2) as u64);
         }
         for k in 0..N / 2 {
