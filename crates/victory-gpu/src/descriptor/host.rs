@@ -1016,6 +1016,10 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
+            // Clear any stale recheck fingerprint so a streamed-out or partial
+            // slot does not re-hash 48 KiB and log "changed after upload" on
+            // every subsequent look (Voltexs 753fa59).
+            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
@@ -1055,6 +1059,7 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
@@ -5564,6 +5569,23 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(q.room(6), 0);
     }
 
+    #[test]
+    fn recheck_clears_when_slot_moves_to_later_or_partly() {
+        let mut q = TextureQueue::default();
+        q.written(7, 1, 0, false);
+        let &[(_, write)] = q.due(1, 10).as_slice() else {
+            panic!("expected slot 7");
+        };
+        q.recheck(7, write, 5, (0x1000, 0x4000), 0xdeadbeef, 2, 1);
+        assert!(q.checked(7).is_some());
+        q.later(7, write, 5, 16);
+        assert!(q.checked(7).is_none(), "later must drop stale recheck fingerprint");
+
+        q.recheck(7, write, 10, (0x1000, 0x4000), 0xfeedface, 1, 6);
+        assert!(q.checked(7).is_some());
+        q.partly(7, write, 11, 0x2000);
+        assert!(q.checked(7).is_none(), "partly must drop stale recheck fingerprint");
+    }
     /// The slots a draw names are handed out whatever their turn: not due
     /// yet, or held back for lack of room. One uploaded whole that waits
     /// for another look is not waiting for its upload; put back, it is
