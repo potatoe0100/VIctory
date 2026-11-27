@@ -77,3 +77,13 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Optimised A/B builds for the nvidia-4060 branch (not the default): thin LTO across crates. Build them with
+# RUSTFLAGS="-C target-cpu=x86-64-v3" in a target folder of their own (AVX2 is already required).
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+
+[profile.diag-lto]
+inherits = "diag"
+lto = "thin"
