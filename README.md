@@ -194,7 +194,7 @@ everything on NVIDIA cards and run fastest there**, using the Series S profile.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Where it stands (2026-11-26)
 
 Tested on one machine only: Windows 11, AMD Ryzen 7 9800X3D, 64 GB RAM,
 GeForce RTX 5070 12 GB, the Series S profile at half render scale
@@ -326,6 +326,13 @@ the 5070. Neither run lost the device; both refused the same 7 programs.
 `-Resolution` works on `play-nvidia.ps1` itself too
 (`-Resolution 720 -SeriesX`), and `-More @{VICTORY_RENDER_SCALE='0.6'}` still
 sets any scale from 0.2 to 1.0.
+
+On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
+high-performance adapter with Shader Model 6.6. The runtime logs its adapter
+name, PCI vendor and device IDs, and dedicated VRAM. Set
+`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
+name to select it explicitly. With the launcher, pass
+`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 
