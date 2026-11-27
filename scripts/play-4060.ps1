@@ -15,6 +15,7 @@
 #   safe      480p, 512 MB of card buffer copies, levels on demand (least video memory)
 #   balanced  540p, 1024 MB (the default)
 #   fast      540p, 1536 MB (the fork's own figure: more memory compares on the card, more frames a second)
+#   max       540p, 2048 MB (A/B: an RTX 3070 Ti 8 GB went from 3.1 to 16.3 fps going 512 -> 2048; tightest fit)
 # -Resolution overrides the preset's resolution.
 # -Tweaks: two settings to compare against a run without them (A/B; not known to help yet):
 #   VICTORY_BAKE_TEXTURES_MS=0 (no wait for textures before the title's decoration bake draws) and
@@ -22,7 +23,7 @@
 # Extra settings can still be passed: -More @{VICTORY_CARD_BUFFERS_MB='512'}
 param(
     [Parameter(Mandatory)][string]$Exe,
-    [ValidateSet('safe', 'balanced', 'fast')][string]$Preset = 'balanced',
+    [ValidateSet('safe', 'balanced', 'fast', 'max')][string]$Preset = 'balanced',
     [ValidateSet('1080', '720', '540', '480')][string]$Resolution,
     [switch]$Quality,
     [switch]$NoSmoothMotion,
@@ -35,6 +36,7 @@ $presets = @{
     safe     = @{ Resolution = '480'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '512'; VICTORY_LEVELS_ON_DEMAND = '1' } }
     balanced = @{ Resolution = '540'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '1024' } }
     fast     = @{ Resolution = '540'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '1536' } }
+    max      = @{ Resolution = '540'; Settings = @{ VICTORY_CARD_BUFFERS_MB = '2048' } }
 }
 $fit8gb = @{}
 foreach ($k in $presets[$Preset].Settings.Keys) { $fit8gb[$k] = $presets[$Preset].Settings[$k] }

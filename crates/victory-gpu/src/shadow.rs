@@ -428,11 +428,26 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = host.uav_buffer(size + card_pad());
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+/// Room past the end of a card copy that nothing writes: a shader that reads
+/// past a buffer (through a root view, which has no bounds) found the next
+/// allocation's bytes in the PC's memory, and an unmapped address on the
+/// card once every buffer had its own copy there: the driver logged MMU
+/// faults in shaders and the device went, four runs in nineteen (from
+/// grimygunnz/nvidia-3070-VI 7c03013, after victory-merged 8528c08).
+/// `VICTORY_CARD_PAD_KB` (64; 0: none). The budget check sees it (the
+/// card's own count); the copies' MB limit does not.
+fn card_pad() -> u64 {
+    static PAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PAD.get_or_init(|| {
+        std::env::var("VICTORY_CARD_PAD_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 10
+    })
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -5509,7 +5524,7 @@ mod window_tests {
 
     /// `scripts/play-4060.ps1`'s presets: name and MiB of card buffer copies
     /// (keep in step with the script).
-    const PRESETS_4060: [(&str, u64); 3] = [("balanced", 1024), ("safe", 512), ("fast", 1536)];
+    const PRESETS_4060: [(&str, u64); 4] = [("balanced", 1024), ("safe", 512), ("fast", 1536), ("max", 2048)];
 
     /// Each of `scripts/play-4060.ps1`'s presets: its card buffer copies, the
     /// room kept for render targets (`targets_room_kept_bytes`) and the texture
@@ -5528,6 +5543,9 @@ mod window_tests {
         for (name, mb) in PRESETS_4060 {
             for (what, budget) in [("", reported), (", 1 GiB less free", reported.saturating_sub(1 << 30))] {
                 let (_, card) = resolve_card_limits(Some(budget), None, Some(mb));
+                // The 64 KiB past each copy, at the most copies there can be
+                // (play-nvidia.ps1 copies buffers of 1 MiB and up).
+                let card = card + card / MIB * 64 * 1024;
                 let targets = crate::resource::targets_room_kept_bytes(Some(budget), None);
                 let floor = (2u64 << 30).min(budget / 4);
                 let line = budget / 100 * 90;
