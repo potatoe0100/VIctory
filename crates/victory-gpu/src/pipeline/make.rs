@@ -663,6 +663,13 @@ mod tests {
 
         assert!(!super::super::library::wanted_early(&p.key));
         assert!(ready(&p).is_none());
+        if compute_waits() {
+            // A dispatch's pipeline (no graphics state) is waited for, and made
+            // here if need be, since VIctory-NVIDIA #243: it is answered now
+            // (no shaders: no host pipeline).
+            assert!(p.made.get().is_some());
+            return;
+        }
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
     }
