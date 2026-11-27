@@ -332,6 +332,14 @@ struct Voice {
     trace: Trace,
 }
 
+impl Voice {
+    fn append_samples(&mut self, pcm: &[i16], channels: usize) {
+        let skip = (self.skip * channels).min(pcm.len());
+        self.skip -= skip / channels;
+        self.pcm.extend(&pcm[skip..]);
+    }
+}
+
 /// What a voice did, for the debug log when it is disabled.
 struct Trace {
     since: Instant,
@@ -629,8 +637,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
                 let mut tail = Vec::new();
+                let channels = decoder.channels();
                 decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.append_samples(&tail, channels);
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -729,9 +738,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
-    voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.append_samples(&pcm, channels);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -1476,6 +1483,56 @@ mod tests {
         assert!(ring[0x200..].iter().all(|&b| b == 0x55));
     }
 
+    fn test_voice() -> Voice {
+        Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_start_skip_can_reach_into_the_final_overlap() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x800, 0x800, 1), S_OK);
+        let mut stream = silent_stream();
+        stream[..4].copy_from_slice(&(1u32 << 26).to_be_bytes());
+        // SAFETY: copy one packet into the allocation of exactly that size.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), xma::PACKET_BYTES) };
+
+        for skip in 4..=7 {
+            let mut words = [0u32; 16];
+            let context = Context(words.as_mut_ptr());
+            context.set(0, 1 | 1 << 20);
+            context.set(2, 32);
+            context.set(5, input_apu);
+            let mut voice = test_voice();
+            voice.skip = skip * xma::SUBFRAME_SAMPLES;
+            assert!(decode(context, &mut voice));
+            assert_eq!(voice.trace.bad_frames, 0);
+            assert!(voice.pcm.is_empty());
+
+            // One 512-sample frame plus a 256-sample overlap is six subframes.
+            let expected = 6usize.saturating_sub(skip) * xma::SUBFRAME_SAMPLES;
+            let has_tail = decode(context, &mut voice);
+            assert_eq!(voice.pcm.len(), expected, "skip {skip} subframes");
+            assert_eq!(has_tail, expected != 0);
+            assert!(voice.ended);
+            assert!(!decode(context, &mut voice));
+        }
+        ApuFree(input);
+    }
+
     /// A loop over the first two frames, which ends after the second
     /// frame's second subframe and starts two subframes into the first.
     /// Each end of the loop is cut in its own frame.
@@ -1512,20 +1569,7 @@ mod tests {
         context.set(3, loop_start);
         context.set(4, second);
         context.set(5, input_apu);
-        let mut voice = Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: 0,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        };
+        let mut voice = test_voice();
         let mut step = |expect_next: u32| {
             let before = voice.pcm.len();
             assert!(decode(context, &mut voice));
