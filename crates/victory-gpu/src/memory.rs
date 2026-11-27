@@ -1128,6 +1128,22 @@ pub(crate) fn ready(
     })
 }
 
+/// Forgets the run of title-memory views kept for host view heap `heap`
+/// (`Memory::heaps`, by address), when the title releases its heap.
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
+/// Whether a run of title-memory views is kept for the host view heap at
+/// address `key` (tests).
+#[cfg(test)]
+pub(crate) fn has_run(key: usize) -> bool {
+    MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.heaps.contains_key(&key))
+}
+
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
 /// one thread that stores a structure's compacted size) and when title memory
 /// has them, and the copies to a place of that size.
