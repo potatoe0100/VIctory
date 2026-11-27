@@ -1598,7 +1598,7 @@ mod tests {
         submit(ENABLE_XMA, &[1]);
         xma().pump();
 
-        let frames = |x: &Xma| lock(&x.voices[1]).as_ref().map(|v| v.trace.frames);
+        let frames = |x: &Xma| lock(&x.voices[1].voice).as_ref().map(|v| v.trace.frames);
         assert_eq!(frames(&xma()), Some(1), "the split frame was decoded");
         // It continues in bank 1, not bank 0.
         assert_eq!(context.field(4, 31, 1), 1);
