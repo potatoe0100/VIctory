@@ -39,6 +39,14 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
 - 16 MiB texture blocks on budgets up to 8.5 GiB (`VICTORY_TEXTURE_BLOCK_MB=64` backs out; the startup log names
   the size).
 
+## 8 PM picks
+
+- NV #901: a held wait nothing meets is passed after 1.5 s (the watchdog crash in 6 of 13 runs;
+  `VICTORY_HELD_WAIT_MS=0` backs out).
+- Melsinus: on cards under 10 GiB the texture line is 82 % and eviction runs at 91/87 %, which ends the evict and
+  refill churn (`VICTORY_SMALL_CARD=0` backs out). The max preset no longer fits under that line with 1 GiB of the
+  card used elsewhere; the budget test prints it but holds only safe, balanced and fast.
+
 ## Intel (off by default)
 
 - `VICTORY_SUBMIT_CORE=1`: the submitting thread gets a fast physical core to itself (2: the process's other

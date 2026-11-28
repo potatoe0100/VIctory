@@ -2186,10 +2186,48 @@ pub(crate) fn room_line(budget: u64) -> u64 {
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
         budget / 100 * room_percent()
     } else if small_card_lines(budget) {
+        // Pick 83, off on this branch unless `VICTORY_SMALL_CARD_LINES=1`.
         budget / 100 * 94
+    } else if small_card(budget) {
+        budget / 100 * SMALL_CARD_LINE_PERCENT
     } else {
         line_for(budget)
     }
+}
+
+/// Of a budget under [`SMALL_CARD_BUDGET`], the share the texture queue
+/// fills to ([`room_line`]), where [`line_for`] gives 90 %.
+const SMALL_CARD_LINE_PERCENT: u64 = 82;
+
+/// The card's budgets that are small ([`small_card`]): 10 GiB, under that of
+/// cards of 12 GB.
+const SMALL_CARD_BUDGET: u64 = 10 << 30;
+
+/// Of a small card's budget, where [`slot_evict`] starts and where it stops
+/// (85 and 75 elsewhere), unless `VICTORY_SLOT_EVICT_PERCENT` or
+/// `VICTORY_SLOT_EVICT_LOW_PERCENT` says.
+const SMALL_CARD_SLOT_EVICT: (u64, u64) = (91, 87);
+
+/// Whether the card is a small one, with a budget under
+/// [`SMALL_CARD_BUDGET`] (cards of 8 to 10 GB), and its lines are those of
+/// one (`VICTORY_SMALL_CARD=0`: as on the others; `VICTORY_AB` can turn it
+/// on and off): the texture queue fills to [`SMALL_CARD_LINE_PERCENT`] of
+/// the budget, and [`slot_evict`] goes from 91 to 87 %.
+///
+/// With 90 % on an RTX 5060 (8 GB, a budget of 6.6-6.9 GB) the card stood
+/// at 6.4-6.6 GB in use, 94-97 % of its budget: the free part of the
+/// texture blocks (400-800 MB) and what is made with no room test lie above
+/// the line. With the system's other programs the card's memory was then
+/// full, and from that moment the submitting thread waited 46-60 ms a frame
+/// for the card where it had waited 9-11 ms, the frame rate down from 13-15
+/// to 10-11 (2026-11-28 run 08:34, two minutes into the world, the queue
+/// filling once the room kept for render targets was given up). Runs that
+/// stood at 86-88 % of the budget had no such waits. And 85 % for
+/// `slot_evict` lay under where the queue stops: it let go of textures down
+/// to 75 % while the queue made them again.
+#[cfg(windows)]
+pub(crate) fn small_card(budget: u64) -> bool {
+    budget < SMALL_CARD_BUDGET && crate::toggled!("VICTORY_SMALL_CARD")
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -2708,9 +2746,17 @@ fn oldest_covering(mut copies: Vec<(usize, u64, u64)>, need: u64) -> Vec<usize> 
 #[cfg(windows)]
 fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let (Some((high, low, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
+    let (Some((mut high, mut low, cap)), Some([budget, used, ..])) = (slot_evict_settings(), video) else {
         return;
     };
+    static PERCENT_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let percent_set = *PERCENT_SET.get_or_init(|| {
+        std::env::var_os("VICTORY_SLOT_EVICT_PERCENT").is_some()
+            || std::env::var_os("VICTORY_SLOT_EVICT_LOW_PERCENT").is_some()
+    });
+    if !percent_set && small_card(budget) {
+        (high, low) = SMALL_CARD_SLOT_EVICT;
+    }
     static RING: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>> =
         std::sync::Mutex::new(std::collections::VecDeque::new());
     let now_ms = crate::host::now_ms();
