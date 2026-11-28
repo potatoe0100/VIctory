@@ -1016,6 +1016,17 @@ impl Host {
     }
 }
 
+/// The PCI vendor of the adapter the host device is made on (the first
+/// DXGI enumerates, as `D3D12CreateDevice` takes without one), if any.
+pub(crate) fn default_adapter_vendor() -> Option<u32> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).ok()?;
+        adapter.GetDesc1().ok().map(|d| d.VendorId)
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 /// LOCAL: the card `VICTORY_ADAPTER` names, for a PC with more than one.
@@ -5390,8 +5401,29 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // The card has run every flight given here (`relay_worker` takes only
+        // those the host's fence says are done), so nothing reads the dynamic
+        // descriptor slots of their lists' tables any more: they are given
+        // back now, not after the copies back below (15 to 30 ms of a frame at
+        // 9,000 draws, 54 to 143 ms while a place loads: upstream run 409).
+        // What the landing does from here on reads buffers and title memory,
+        // no view heap slot of these lists. (The release below, as the lists
+        // are told, then finds nothing to give back.) From fxceless f299fba1.
+        let mut gave = false;
+        for item in &mut items {
+            if let Late::Run(flight) = item {
+                for detached in &mut flight.lists {
+                    detached.tables_done();
+                }
+                gave |= !flight.lists.is_empty();
+            }
+        }
+        if gave {
+            // (A draw waiting for slots looks again: `wait_for_slots`.)
+            LINE_LANDED.notify_all();
+        }
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -8531,7 +8563,10 @@ impl Batch {
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
-        let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
+        let summed = [
+            PREPARING[0].load(Ordering::Relaxed).saturating_sub(before[0]),
+            PREPARING[2].load(Ordering::Relaxed).saturating_sub(before[1]),
+        ];
         PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
         PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);

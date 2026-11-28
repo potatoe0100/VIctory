@@ -707,6 +707,15 @@ impl Layout {
         if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
+        // Depth slices must not lie on top of one another: a pitch smaller
+        // than one slice's rows would copy the rows of two slices over each
+        // other and still succeed, silently losing the earlier slice's rows.
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|rows| rows.checked_add(bytes));
+        if depth > 1 && slice_bytes.is_none_or(|slice_rows| depth_pitch < slice_rows) {
+            return Err(Error::TooSmall);
+        }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
@@ -1500,6 +1509,40 @@ mod tests {
             layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
             Err(Error::TooSmall)
         );
+    }
+
+    /// A depth pitch must leave each depth slice its own rows: a tighter one
+    /// would copy two slices' rows on top of each other and still report
+    /// success, losing the earlier slice's rows.
+    #[test]
+    fn a_depth_pitch_that_overlaps_slices_is_refused() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(4, 2, 1, 4, swizzle)
+            })
+            .unwrap();
+            let m = layout.mips[0];
+            let bytes = m.width as usize * 4;
+            let row = 20usize;
+            // The end of the first depth slice's rows.
+            let slice = (m.height as usize - 1) * row + bytes;
+            let mut tiled = vec![0u8; layout.size as usize];
+            let mut linear = vec![0u8; (slice + 1) * m.depth as usize];
+            // One byte short: the second slice starts inside the first's rows.
+            assert_eq!(
+                layout.detile(&tiled, 0, 0, &mut linear, row, slice - 1),
+                Err(Error::TooSmall)
+            );
+            assert_eq!(
+                layout.tile(&mut tiled, 0, 0, &linear, row, slice - 1),
+                Err(Error::TooSmall)
+            );
+            // The slice's own bytes, or more, are fine.
+            assert!(layout.detile(&tiled, 0, 0, &mut linear, row, slice).is_ok());
+            assert!(layout.tile(&mut tiled, 0, 0, &linear, row, slice).is_ok());
+        }
     }
 
     #[test]

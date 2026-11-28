@@ -1196,14 +1196,24 @@ pub extern "system" fn XMemMapPhysicalPages(
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
+        unmap(&mut physical, base, n * PAGE);
         return address;
     };
+    // Every page is looked at before the destination is touched: a title
+    // keeps what its buffer showed on a remap that failed, and a page number
+    // its list kept after XMemFreePhysicalPages (or one whose allocation was
+    // late) must not leave that buffer unmapped, its next access a fault
+    // (fxceless/victory-fork#1460).
     let slices: Vec<Option<Slice>> = {
         let table = page_table();
         pages.iter().map(|page| table.pages.get(page).cloned()).collect()
     };
+    if let Some(i) = (0..n).find(|&i| slices[i].is_none()) {
+        tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page, nothing changed");
+        return std::ptr::null_mut();
+    }
+    unmap(&mut physical, base, n * PAGE);
     let mut i = 0;
     while i < n {
         let Some(first) = slices[i].clone() else {
@@ -1272,7 +1282,8 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`):
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. Page by page; false if a source page is not mapped physical memory,
+/// with the destination left as it was.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
@@ -1280,16 +1291,23 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
+    // Every source page is looked at before the destination is touched:
+    // `unmap` takes whole views away, so a source range that overlaps the
+    // destination lost its pages with it, and a source page that is not
+    // mapped physical memory left the destination a hole (fxceless
+    // /victory-fork#1460). The slices keep their sections alive meanwhile.
+    let mut slices = Vec::new();
+    if from != 0 {
+        for k in (0..len).step_by(PAGE) {
+            let Some(slice) = physical.slice_at(from + k) else {
+                return false;
+            };
+            slices.push(slice);
         }
-        let at = from + k;
-        let Some(slice) = physical.slice_at(at) else {
-            return false;
-        };
-        if !map(&mut physical, to + k, PAGE, slice) {
+    }
+    unmap(&mut physical, to, len);
+    for (k, slice) in slices.into_iter().enumerate() {
+        if !map(&mut physical, to + k * PAGE, PAGE, slice) {
             return false;
         }
     }
@@ -2267,6 +2285,53 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// A remap that cannot be served (a page number not in the table, as one
+    /// a list kept after `XMemFreePhysicalPages`) changes nothing: the
+    /// buffer goes on showing what it showed, readable. A page-mapping copy
+    /// whose source is not all mapped leaves its destination as it was too,
+    /// and one whose source overlaps its destination keeps the source's pages
+    /// (fxceless/victory-fork#1460).
+    #[test]
+    fn a_remap_that_cannot_be_served_changes_nothing() {
+        let mut pages = [0usize; 3];
+        let mut n = 3;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let b = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null() && !b.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: both pages are mapped read-write.
+        unsafe {
+            a.cast::<u8>().write(11);
+            at(a, 1).cast::<u8>().write(22);
+        }
+        // The second number is unknown: null, and `a` shows what it showed.
+        let unknown = 0x7ff_fff0usize;
+        let bad = [pages[2], unknown];
+        assert!(XMemMapPhysicalPages(a, 2, bad.as_ptr()).is_null());
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        assert_eq!(query(at(a, 1)).host.State, MEM_COMMIT);
+        // SAFETY: still mapped, as before the call.
+        assert_eq!(unsafe { (a.cast::<u8>().read(), at(a, 1).cast::<u8>().read()) }, (11, 22));
+        // A copy from a source with a hole (page 2 of `a` is not mapped):
+        // false, and what `b` showed stays.
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages[2..].as_ptr()), b);
+        // SAFETY: mapped read-write.
+        unsafe { b.cast::<u8>().write(33) };
+        assert!(!map_alias(b as u64, at(a, 1) as u64, 2 * PAGE as u64));
+        assert_eq!(query(b).host.State, MEM_COMMIT);
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { b.cast::<u8>().read() }, 33);
+        // A copy onto itself, two pages shifted by one: the source's second
+        // page lies in the destination, and survives its unmapping.
+        assert!(map_alias(at(a, 1) as u64, a as u64, 2 * PAGE as u64));
+        // SAFETY: mapped read-write.
+        let shown = unsafe { (a.cast::<u8>().read(), at(a, 1).cast::<u8>().read(), at(a, 2).cast::<u8>().read()) };
+        assert_eq!(shown, (11, 11, 22));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a

@@ -42,6 +42,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// what it was told of the host. Not our executable: a rebuild of anything
 /// else used to translate every shader again.
 fn build() -> [u8; 32] {
+    let sub_loops = atomic_sub_setting();
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
     crate::descriptor::host::probe_view_limit();
@@ -81,6 +82,13 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_THREAD_TICKET",
+            // LOCAL: switches of later picks that pick a form too (kibagami
+            // f5f48b97 keys the water tile slots the same way).
+            "VICTORY_WATER_TILE_SLOTS",
+            "VICTORY_CODE_TABLE_AFTER_CODE",
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_RDNA_FLOAT",
+            "VICTORY_WATERFALL_SHAPE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -98,7 +106,32 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    hash.update(&[u8::from(sub_loops)]);
     *hash.finalize().as_bytes()
+}
+
+/// Tells the translator, once, whether atomic subtractions on group memory
+/// are written as compare-exchange loops
+/// ([`victory_shader::emit::atomic_sub_loops`]), which NVIDIA's compiler
+/// needs: it refuses such a pipeline as out of memory (weatherParticle's
+/// CS_BeginUpdate, whose dispatches were dropped). Decided by the vendor of
+/// the adapter the host device is made on; `VICTORY_ATOMIC_SUB_LOOP=1` or
+/// `=0` says otherwise. Part of the key ([`build`]). Upstream #3619.
+pub fn atomic_sub_setting() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| {
+        const NVIDIA: u32 = 0x10DE;
+        let on = match std::env::var("VICTORY_ATOMIC_SUB_LOOP").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::host::default_adapter_vendor() == Some(NVIDIA),
+        };
+        victory_shader::emit::set_atomic_sub_loops(on);
+        if on {
+            tracing::info!("atomic subtractions on group memory are compare-exchange loops");
+        }
+        on
+    })
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -121,8 +154,23 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    atomic_sub_setting();
+    let wide = wave_wide(container);
+    let translate = |c: &[u8]| {
+        if wide {
+            victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(c))
+        } else {
+            victory_shader::emit::translate(c)
+        }
+        .map_err(|e| e.to_string())
+    };
     let shader = match CACHE.get() {
+        // The form allowed is part of what the entry was made from.
+        Some(cache) if wide => {
+            let mut build = build();
+            build[0] ^= 0x57;
+            cached(cache, &build, container, translate)
+        }
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }?;
@@ -167,6 +215,43 @@ fn paired_override(container: &[u8], mut shader: HostShader) -> HostShader {
     }
     tracing::warn!(hash, "paired shader entry did not match the translated shader bindings");
     shader
+}
+
+/// Console wave64 compute programs that a 32-lane host (NVIDIA) refuses as
+/// translated (they ask for 64-lane waves) and that run in the wave-wide
+/// branches form: the water's transmission volumetrics
+/// (`_VolumePortalsOnly`, `Submerged`) and `sr_tracing`'s
+/// `CS_Tiling_Generate_Opaque`. From fxceless/victory-fork#1248 (Matheus
+/// "Jigsaw" Almeida), measured on an RTX 5060 Ti: a 30-minute session from
+/// the boat mission to the camp with the water right (no black patches, the
+/// boat floats). Left out there: the particles' `CS_Visibility`
+/// (369cbe906ea72764), which stopped the card on the first world frame, and
+/// the volumetrics' `_Tiled` and `_Tiled_LocalLights` (5dc3b25986622949,
+/// 6f225b641c5b0708), which put black patches on the water.
+/// `VICTORY_WAVE_WIDE_LIST` adds hashes (comma-separated),
+/// `VICTORY_WAVE_WIDE_SEEN=0` leaves these out (the added ones still count),
+/// `VICTORY_WAVE_WIDE=0` turns the form off.
+const WAVE_WIDE_SEEN: [&str; 3] = ["a10179ab7eda0dc3", "926c46bab3b86bd6", "2cc4c197ee29e291"];
+
+/// Whether `container` takes the wave-wide branches form ([`WAVE_WIDE_SEEN`]
+/// or the hashes added).
+fn wave_wide(container: &[u8]) -> bool {
+    static ADDED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let added = ADDED.get_or_init(|| std::env::var("VICTORY_WAVE_WIDE_LIST").map(|v| wave_wide_list(&v)).unwrap_or_default());
+    static SEEN_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let seen_on = *SEEN_ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_SEEN").is_none_or(|v| v != "0"));
+    wave_wide_of(&blake3::hash(container).to_hex()[..16], seen_on, added)
+}
+
+/// The hashes of `VICTORY_WAVE_WIDE_LIST`: comma-separated, lower case.
+fn wave_wide_list(v: &str) -> Vec<String> {
+    v.split(',').map(|h| h.trim().to_lowercase()).filter(|h| !h.is_empty()).collect()
+}
+
+/// [`wave_wide`] for a container whose hash (16 hex digits, as the pipeline
+/// logs name programs) is `hash`.
+fn wave_wide_of(hash: &str, seen_on: bool, added: &[String]) -> bool {
+    (seen_on && WAVE_WIDE_SEEN.contains(&hash)) || added.iter().any(|h| h == hash)
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -409,6 +494,25 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The programs seen to run in the wave-wide form take it unless
+    /// `VICTORY_WAVE_WIDE_SEEN=0`; added hashes take it either way; the
+    /// particles' and tiled volumetrics' programs left out upstream do not.
+    #[test]
+    fn the_programs_seen_take_the_wave_wide_form() {
+        let none: Vec<String> = Vec::new();
+        for hash in WAVE_WIDE_SEEN {
+            assert_eq!(hash.len(), 16);
+            assert!(wave_wide_of(hash, true, &none));
+            assert!(!wave_wide_of(hash, false, &none));
+        }
+        for left_out in ["369cbe906ea72764", "5dc3b25986622949", "6f225b641c5b0708"] {
+            assert!(!wave_wide_of(left_out, true, &none));
+        }
+        let added = wave_wide_list(" 369CBE906EA72764, ,abc ");
+        assert_eq!(added, ["369cbe906ea72764", "abc"]);
+        assert!(wave_wide_of("369cbe906ea72764", false, &added));
+    }
 
     fn shader() -> HostShader {
         HostShader {

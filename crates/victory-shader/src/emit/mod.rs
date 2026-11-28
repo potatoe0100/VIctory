@@ -147,6 +147,24 @@ pub(crate) fn clock(n: usize, since: std::time::Instant) {
     });
 }
 
+static ATOMIC_SUB_LOOPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether atomic subtractions are written as compare-exchange loops (off
+/// until [`set_atomic_sub_loops`]): `atomicrmw sub`, and `atomicrmw add` of
+/// a value written as a negation (the console's `ds_sub_u32`, and
+/// `ds_add_u32` of a value the program negated). NVIDIA's compiler refuses
+/// the pipeline of a program with either on group-shared memory as out of
+/// memory. The setting is part of the translation, so the shader cache must
+/// key on it (`victory-gpu`'s does).
+pub fn atomic_sub_loops() -> bool {
+    ATOMIC_SUB_LOOPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets [`atomic_sub_loops`] for the translations made from now on.
+pub fn set_atomic_sub_loops(on: bool) {
+    ATOMIC_SUB_LOOPS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -406,6 +424,36 @@ impl HostShader {
     }
 }
 
+thread_local! {
+    // The program being translated may take the wave-wide branches form
+    // ([`with_wave_wide`]).
+    static WAVE_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation on this thread) with the wave-wide branches form
+/// allowed for a console wave64 compute program on a host of 32-lane waves,
+/// as `VICTORY_WAVE_WIDE=1` allows it for all. For programs seen to run in
+/// that form (`victory-gpu`'s shader cache lists them): it puts group
+/// barriers inside branches and loops, and two particle programs lost the
+/// card in it. From fxceless/victory-fork#1248.
+pub fn with_wave_wide<T>(f: impl FnOnce() -> T) -> T {
+    let before = WAVE_WIDE.with(|w| w.replace(true));
+    let out = f();
+    WAVE_WIDE.with(|w| w.set(before));
+    out
+}
+
+/// Whether the wave-wide branches form may be taken: `VICTORY_WAVE_WIDE=1`
+/// for every program, `=0` for none, else for those [`with_wave_wide`] asks
+/// it for.
+fn wave_wide_allowed() -> bool {
+    match std::env::var_os("VICTORY_WAVE_WIDE") {
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        _ => WAVE_WIDE.with(std::cell::Cell::get),
+    }
+}
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -561,7 +609,9 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // Also for the programs a caller has seen run in it ([`with_wave_wide`]),
+        // unless `VICTORY_WAVE_WIDE=0`.
+        let wide_on = wave_wide_allowed();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -1009,6 +1059,24 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// The wave-wide form is allowed inside `with_wave_wide` only (unless
+    /// `VICTORY_WAVE_WIDE` says otherwise), and the thread's value comes back
+    /// after, also nested.
+    #[test]
+    fn the_wave_wide_form_is_allowed_inside_the_call_only() {
+        if std::env::var_os("VICTORY_WAVE_WIDE").is_some() {
+            return;
+        }
+        assert!(!super::wave_wide_allowed());
+        let (inside, nested, after_nested) = super::with_wave_wide(|| {
+            let inside = super::wave_wide_allowed();
+            let nested = super::with_wave_wide(super::wave_wide_allowed);
+            (inside, nested, super::wave_wide_allowed())
+        });
+        assert!(inside && nested && after_nested);
+        assert!(!super::wave_wide_allowed());
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.

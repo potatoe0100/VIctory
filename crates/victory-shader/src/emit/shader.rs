@@ -604,6 +604,11 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
+        // NVIDIA refuses atomic subtractions on group memory: loops, before
+        // anything is declared (upstream #3619).
+        if super::atomic_sub_loops() {
+            self.m.atomic_subtracts();
+        }
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
         if passes != 0 {
             #[cfg(test)]
