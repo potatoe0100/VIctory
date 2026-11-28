@@ -554,6 +554,45 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// [`bury`], on a thread of its own (`VICTORY_BURY_ASIDE`, on; 0: on the
+/// caller's, as before). Dropping what waited is the driver freeing card
+/// memory and the kernel unmapping it, 16 to 33 ms a frame on the relay in
+/// 507kazz's run of 28 Nov: the next flight's landing, and the title's fence
+/// behind it, waited for it. From 507kazz/507KAZ-Edition af12d460 (GPL-3.0).
+fn bury_soon(finished: u64) {
+    use std::sync::atomic::AtomicU64;
+    static ASIDE: OnceLock<bool> = OnceLock::new();
+    if !*ASIDE.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_none_or(|v| v != "0")) {
+        bury(finished);
+        return;
+    }
+    static TO: AtomicU64 = AtomicU64::new(0);
+    static THREAD: OnceLock<Option<std::thread::Thread>> = OnceLock::new();
+    TO.fetch_max(finished, Ordering::AcqRel);
+    let thread = THREAD.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(|| {
+                let mut done = 0u64;
+                loop {
+                    let to = TO.load(Ordering::Acquire);
+                    if to > done {
+                        bury(to);
+                        done = to;
+                    } else {
+                        std::thread::park_timeout(std::time::Duration::from_millis(50));
+                    }
+                }
+            })
+            .ok()
+            .map(|h| h.thread().clone())
+    });
+    match thread {
+        Some(t) => t.unpark(),
+        None => bury(finished),
+    }
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -5536,7 +5575,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            bury_soon(last);
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -6009,7 +6048,7 @@ impl Host {
             }
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
-                bury(last);
+                bury_soon(last);
             }
             line().landed.extend(landed);
         }
@@ -6463,7 +6502,7 @@ impl Host {
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
+        bury_soon(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);

@@ -30,6 +30,13 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
   the first start re-translates.
 - NV #803: diagnostics counters for render-target copy growth.
 
+## 7 PM picks
+
+- NV #856: Streamline's out-of-video-memory result no longer stops frame generation on an 8 GB card.
+- NV #834: a write-watch race that crashed with an access violation.
+- NV #825: card awake runs only in gameplay frames.
+- 507kazz af12d460: finished submissions freed off the relay (16-33 ms a frame there; `VICTORY_BURY_ASIDE=0` backs out).
+
 ## Intel (off by default)
 
 - `VICTORY_SUBMIT_CORE=1`: the submitting thread gets a fast physical core to itself (2: the process's other
