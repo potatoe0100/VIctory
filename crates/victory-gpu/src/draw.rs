@@ -3183,7 +3183,9 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let pressured = crate::residency::pressured();
+        let catchup_active = catchup && on_time >= 256 && room && !pressured;
+        let (per_frame, span) = if catchup_active { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -3200,7 +3202,7 @@ impl State {
         } else {
             crate::residency::prefetch_limit(
                 bytes_at_most,
-                crate::residency::pressured(),
+                pressured,
                 crate::residency::critical_commit(),
                 crate::residency::limited_host_ram(),
                 crate::texture::live_staging_bytes(),
@@ -3211,11 +3213,13 @@ impl State {
         // before a bake) within `VICTORY_TEXSPK_PASS_MS` together
         // ([`texspk_pass_ms`]).
         let frame_pass = !required && !baking && sync.is_none();
+        let vram_budget = memory.map(|[budget, ..]| budget);
         let span = match texspk_pass_ms() {
             Some(cap) if frame_pass => {
                 if PASS_FRAME.swap(frame, Ordering::Relaxed) != frame {
                     PASS_FRAME_NANOS.store(0, Ordering::Relaxed);
                 }
+                let cap = texspk_cap_ms(cap, vram_budget, room, pressured, catchup_active);
                 pass_span_left(span, cap, PASS_FRAME_NANOS.load(Ordering::Relaxed))
             }
             _ => span,
@@ -3314,7 +3318,19 @@ impl State {
             let mut partly = None;
             let mut there = None;
             // The view the slot holds now, read once for the looks below.
-            let held = rest(1, || heap.handle(index).and_then(crate::descriptor::view));
+            let handle = rest(1, || heap.handle(index));
+            let (held_key, held) = match handle.and_then(crate::descriptor::view_with_key) {
+                Some((key, view)) => (Some(key), Some(view)),
+                None => (None, None),
+            };
+            // Re-read the handle and verify the slot still holds the same
+            // view record before any step that writes host descriptors, so a
+            // concurrent slot rewrite by the title cannot expose a new view
+            // using the previous view's upload.
+            let fresh_handle = || {
+                heap.handle(index)
+                    .filter(|&h| held_key.is_none_or(|k| crate::descriptor::host::record_key(h) == k))
+            };
             if let Some(View::Placed(false, resource, desc)) = &held {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(desc);
@@ -3371,7 +3387,7 @@ impl State {
             // before.
             if !room {
                 let has_its_texture = reupload_when_full()
-                    && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)));
+                    && handle.is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
                     outcome(slot_outcome::HELD);
@@ -3430,17 +3446,17 @@ impl State {
             let shows_other = !baking
                 && !sync_bake
                 && crate::resource::held_only()
-                && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_shows_other(index, handle)));
+                && handle.is_some_and(|handle| host.texture_slot_shows_other(index, handle));
             // A slot that shows nothing of it yet, or something else, shows it
             // when the upload has run too.
             let late = !shows_other
                 && !baking
                 && !sync_bake
                 && crate::descriptor::host::show_after()
-                && rest(1, || heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle)));
+                && handle.is_some_and(|handle| !host.texture_slot_made_from(index, handle));
             let (view, bake_key) = timed(6, || {
                 if sync_bake {
-                    match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
+                    match fresh_handle().and_then(|handle| host.prepare_bake_slot(index, handle)) {
                         Some((view, key)) => (Some(view), Some(key)),
                         None => (None, None),
                     }
@@ -3449,12 +3465,12 @@ impl State {
                     // again, the views' table was asked twice a slot).
                     (held.clone(), None)
                 } else {
-                    (heap.handle(index).and_then(|handle| host.mirror(index, handle, true)), None)
+                    (fresh_handle().and_then(|handle| host.mirror(index, handle, true)), None)
                 }
             });
             // (`nothing`: the slot has nothing to bring up to date.)
             let at_once = |nothing: bool| {
-                if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
+                if (late || bake_key.is_some()) && let Some(handle) = fresh_handle() {
                     HEAP_TEXTURE_NOTHING[3].fetch_add(u64::from(nothing), Ordering::Relaxed);
                     shown(0, || {
                         let _ = host.mirror(index, handle, true);
@@ -3503,20 +3519,20 @@ impl State {
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 outcome(slot_outcome::SAME);
-                if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+                if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, fresh_handle()) {
                     if let Some(copy) = crate::resource::host_copy(resource) {
                         sync.keep.push(copy);
                     }
                     sync.publish.push((index, handle, key));
                 } else {
-                    if shows_other && let Some(handle) = heap.handle(index) {
+                    if shows_other && let Some(handle) = fresh_handle() {
                         shown(2, || {
                             let _ = host.mirror(index, handle, true);
                         });
                     }
                     // Its bytes are in, or on the way there in a list before.
                     if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
-                        if let Some(handle) = heap.handle(index) {
+                        if let Some(handle) = fresh_handle() {
                             shown(1, || host.texture_slot_show_after(list, index, handle));
                         }
                     } else {
@@ -3547,7 +3563,7 @@ impl State {
                 use crate::texture::ahead::Taken;
                 let (Taken::New(job) | Taken::Known(job)) = ahead;
                 rest(3, || {
-                    if let Some(handle) = heap.handle(index) {
+                    if let Some(handle) = fresh_handle() {
                         host.texture_slot_show_ahead(job, index, handle);
                     }
                     if let Taken::New(job) = ahead {
@@ -3579,16 +3595,16 @@ impl State {
                 served = false;
                 break;
             }
-            if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+            if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, fresh_handle()) {
                 if let Some(copy) = crate::resource::host_copy(resource) {
                     sync.keep.push(copy);
                 }
                 sync.publish.push((index, handle, key));
             }
-            if shows_other && let Some(handle) = heap.handle(index) {
+            if shows_other && let Some(handle) = fresh_handle() {
                 shown(2, || host.texture_slot_flip(list, index, handle));
             }
-            if late && let Some(handle) = heap.handle(index) {
+            if late && let Some(handle) = fresh_handle() {
                 shown(1, || host.texture_slot_show_after(list, index, handle));
             }
             #[cfg(feature = "diagnostics")]
@@ -5975,6 +5991,40 @@ fn pass_span_left(span: std::time::Duration, cap_ms: u64, spent_ns: u64) -> std:
     span.min(cap.saturating_sub(std::time::Duration::from_nanos(spent_ns)))
 }
 
+/// Effective per-frame texture pass cap in milliseconds from the configured
+/// `VICTORY_TEXSPK_PASS_MS` baseline.
+///
+/// Cards with > 12 GiB VRAM and free room get twice the baseline cap (capped
+/// at 1000 ms) so larger staging budgets can drain, and an active catch-up
+/// burst (`on_time >= 1024`, `room`, not pressured) triples the baseline cap
+/// instead of being clamped back down to the calm-frame cap. Cards at
+/// `<= 12 GiB`, full cards (`!room`), or pressured host RAM keep the baseline
+/// cap.
+fn texspk_cap_ms(
+    base_cap_ms: u64,
+    vram_budget: Option<u64>,
+    room: bool,
+    pressured: bool,
+    catchup_active: bool,
+) -> u64 {
+    const GIB: u64 = 1 << 30;
+    if !room || pressured {
+        return base_cap_ms;
+    }
+    let scaled = if catchup_active {
+        if vram_budget.is_some_and(|b| b > 12 * GIB) {
+            base_cap_ms.saturating_mul(4)
+        } else {
+            base_cap_ms.saturating_mul(3)
+        }
+    } else if vram_budget.is_some_and(|b| b > 12 * GIB) {
+        base_cap_ms.saturating_mul(2)
+    } else {
+        base_cap_ms
+    };
+    scaled.min(1000)
+}
+
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
 /// budget (`None` keeps the 192 MiB 12 GiB baseline).
 fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
@@ -6004,6 +6054,23 @@ mod tests {
         assert_eq!(pass_span_left(ms(16), 8, 5_000_000), ms(3));
         // Spent: nothing (the run stops at its first slot).
         assert_eq!(pass_span_left(ms(16), 8, 9_000_000), Duration::ZERO);
+    }
+
+    #[test]
+    fn texspk_cap_scales_with_vram_and_catchup() {
+        use super::texspk_cap_ms;
+        const GIB: u64 = 1 << 30;
+        // 12 GiB baseline keeps 8 ms when calm and scales to 24 ms on catchup.
+        assert_eq!(texspk_cap_ms(8, Some(12 * GIB), true, false, false), 8);
+        assert_eq!(texspk_cap_ms(8, Some(12 * GIB), true, false, true), 24);
+        // >12 GiB (e.g. 16 GiB RTX 5080) with room doubles calm cap to 16 ms, 32 ms on catchup.
+        assert_eq!(texspk_cap_ms(8, Some(16 * GIB), true, false, false), 16);
+        assert_eq!(texspk_cap_ms(8, Some(16 * GIB), true, false, true), 32);
+        // Full card or host-RAM pressure never expands the cap.
+        assert_eq!(texspk_cap_ms(8, Some(16 * GIB), false, false, true), 8);
+        assert_eq!(texspk_cap_ms(8, Some(16 * GIB), true, true, true), 8);
+        // Clamped at 1000 ms.
+        assert_eq!(texspk_cap_ms(600, Some(16 * GIB), true, false, true), 1000);
     }
 
     #[test]

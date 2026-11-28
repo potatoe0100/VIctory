@@ -22,6 +22,14 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
 - Tile floor 256 KiB under 9 GiB; opt-in top-mip cap (`VICTORY_LEVELS_MAX_DIM`) and tile reclaim
   (`VICTORY_LEVELS_RECLAIM=1`), both off.
 
+## 6 PM picks
+
+- NV #816: texture and staging blocks made outside the pool lock (MakeResident stalls of 1.1-1.6 s near the budget).
+- NV #814: texture refreshes 9.4 to 1.8 ms, stalls 26 to 0 (its play.rs switches on).
+- NV #809: about 900 shader programs no longer refused (200-270 draws a frame were dropped). Shader output changes:
+  the first start re-translates.
+- NV #803: diagnostics counters for render-target copy growth.
+
 ## Intel (off by default)
 
 - `VICTORY_SUBMIT_CORE=1`: the submitting thread gets a fast physical core to itself (2: the process's other

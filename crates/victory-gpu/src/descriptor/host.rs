@@ -576,7 +576,7 @@ pub(crate) fn flip_now() {
 pub(crate) static FLIPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The key of the record at `handle`, a view's descriptor slot; 0: none.
-fn record_key(handle: u64) -> u64 {
+pub(crate) fn record_key(handle: u64) -> u64 {
     // SAFETY: the handle is a descriptor slot in title memory.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }
@@ -1364,23 +1364,53 @@ impl Due {
     /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
     /// each when they were taken.
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
+        static FRESH_FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fresh_first = *FRESH_FIRST.get_or_init(|| std::env::var_os("VICTORY_DUE_FRESH_FIRST").is_some_and(|v| v == "1"));
+        self.ordered_with(max, fresh_first)
+    }
+
+    fn ordered_with(self, max: usize, fresh_first: bool) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
         let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
         again.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
         fresh.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
-        let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        let mut known: Vec<Option<Checked>> = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        let push_fresh = |order: &mut Vec<(u32, u64)>, known: &mut Vec<Option<Checked>>| {
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old && order.len() < max {
+                order.push((fresh[new].1, fresh[new].2));
+                known.push(None);
+                new += 1;
+                if new < old && order.len() < max {
+                    old -= 1;
+                    order.push((fresh[old].1, fresh[old].2));
+                    known.push(None);
+                }
             }
+        };
+        let push_again = |order: &mut Vec<(u32, u64)>, known: &mut Vec<Option<Checked>>, recheck: Option<bool>| {
+            for &(_, index, write, checked) in &again {
+                if order.len() >= max {
+                    break;
+                }
+                if recheck.is_none_or(|want| checked.is_some() == want) {
+                    order.push((index, write));
+                    known.push(checked);
+                }
+            }
+        };
+        if fresh_first {
+            push_fresh(&mut order, &mut known);
+            push_again(&mut order, &mut known, None);
+        } else {
+            // Unuploaded retries (`later`/`partly`) first, then `fresh`
+            // never-uploaded slots, then already-uploaded `recheck` slots so
+            // thousands of `recheck` slots cannot starve `fresh` textures.
+            push_again(&mut order, &mut known, Some(false));
+            push_fresh(&mut order, &mut known);
+            push_again(&mut order, &mut known, Some(true));
         }
-        order.truncate(max);
-        known.resize(order.len(), None);
         (order, known)
     }
 }
@@ -2894,34 +2924,32 @@ impl HostHeap {
     /// until then it shows what it showed. (Made at once, the frames on the
     /// card read the new view before its levels were filled.)
     pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        self.flip(list, index, handle, None);
+        self.flip(list, index, handle, record_key(handle), None);
     }
 
     /// The same of a slot that shows nothing of the texture the record at
     /// `handle` views, or something else: until then it shows the neutral
     /// texture ([`show_after`]).
     pub(crate) fn texture_slot_show_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        if self.show_later(index, handle) {
-            self.flip(list, index, handle, Some(crate::frame::current()));
+        if let Some(key) = self.show_later(index, handle) {
+            self.flip(list, index, handle, key, Some(crate::frame::current()));
         }
     }
 
     /// What slot `index` shows until the texture the record at `handle` views
-    /// is shown. False: it shows it, or there is none.
-    fn show_later(&self, index: u32, handle: u64) -> bool {
+    /// is shown. `None`: it shows it, or there is none.
+    fn show_later(&self, index: u32, handle: u64) -> Option<u64> {
         use std::sync::atomic::Ordering::Relaxed;
         let key = record_key(handle);
         let view = view_at(key as u32, (key >> 32) as u32);
         let (true, Some(view)) = (key != 0, view) else {
-            return false;
+            return None;
         };
         let stale = {
             let _made = self.made.lock(index);
-            let Some(shown) = self.made.get(index) else {
-                return false;
-            };
+            let shown = self.made.get(index)?;
             if shown == key {
-                return false;
+                return None;
             }
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
@@ -2944,16 +2972,16 @@ impl HostHeap {
             stale
         };
         self.unmake_stale(index, stale);
-        true
+        Some(key)
     }
 
     /// [`HostHeap::texture_slot_show_after`] of a texture whose upload `job`
     /// makes: shown when that has run.
     pub(crate) fn texture_slot_show_ahead(&self, job: &crate::texture::ahead::Job, index: u32, handle: u64) {
-        if !self.show_later(index, handle) {
+        let Some(key) = self.show_later(index, handle) else {
             return;
-        }
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        };
+        let heap = std::ptr::from_ref(self) as usize;
         let late = Some(crate::frame::current());
         job.then(move || {
             let flip = Flip { after: 0, heap, index, handle, key, late };
@@ -2980,9 +3008,9 @@ impl HostHeap {
         self.mirror(index, handle, true);
     }
 
-    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
+    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64, late: Option<u64>) {
         use std::sync::atomic::Ordering::{Relaxed, Release};
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let heap = std::ptr::from_ref(self) as usize;
         let id = NEXT_PENDING_FLIP.fetch_add(1, Relaxed);
         let origin = (std::ptr::from_ref(list) as usize, list.epoch());
         {
@@ -6433,6 +6461,22 @@ mod tests {
         for at in [0, 12, 20] {
             assert_eq!(q.due_and_census(at).1, q.census(at));
         }
+    }
+
+    #[test]
+    fn due_fresh_first_prevents_again_starvation() {
+        let mut due = Due::default();
+        due.again.push((1, 100, 10, None));
+        due.again.push((2, 101, 11, None));
+        due.fresh.push((3, 200, 12));
+        let (again_first, _) = Due {
+            again: due.again.clone(),
+            fresh: due.fresh.clone(),
+        }
+        .ordered_with(2, false);
+        assert_eq!(again_first, [(101, 11), (100, 10)]);
+        let (fresh_first, _) = due.ordered_with(2, true);
+        assert_eq!(fresh_first, [(200, 12), (101, 11)]);
     }
 
     /// Slots held back for lack of room on the card are not handed out
