@@ -9,8 +9,10 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
   94 % and room for card buffer copies at most a sixteenth of the budget.
 - Bindless feedback (skornuta, `VICTORY_BINDLESS_FEEDBACK=1` set by play.rs): NV's slot eviction may drop textures
   picked by index that no shader has read for 60 s.
-- Render-target room at most a quarter of the budget on cards of 9 GiB or less (3,072 MiB was half of a 4060's
-  6.2 GB budget; the 8 GB presets did not fit it with 1 GiB of the card used by other programs).
+- NV #730: render-target room at most three tenths of the budget (3,072 MiB was half of a 4060's budget; the 8 GB
+  presets did not fit it with 1 GiB of the card used by other programs). NV #713: DRED records page faults only (its
+  breadcrumbs cost about 37 ms of card time a frame). NV #784 (`VICTORY_SPARE_SCALE=1` in play.rs) and NV #700
+  (scratch chunks used again).
 - Texture room only while the card is under its budget (edupode a0ead598): free parts of mostly empty blocks no
   longer count as room once the card is past it.
 - List upload buffers pooled (edupode 62bba05, `VICTORY_UPLOAD_POOL=0` backs out).

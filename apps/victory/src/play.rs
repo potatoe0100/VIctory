@@ -118,6 +118,9 @@ const SETTINGS: &[(&str, &str)] = &[
     // "indexed textures had no room" waits of 8 GB cards). Its pipelines are a library of their
     // own; the shader cache warms again once. VICTORY_BINDLESS_FEEDBACK=0 leaves it out.
     ("VICTORY_BINDLESS_FEEDBACK", "1"),
+    // Empty texture blocks kept in proportion to the budget (about 4 on an
+    // 8 GB card, not up to 64). VICTORY_SPARE_SCALE=0 keeps the old count.
+    ("VICTORY_SPARE_SCALE", "1"),
 ];
 
 /// Path settings a start keeps from its surroundings; every other

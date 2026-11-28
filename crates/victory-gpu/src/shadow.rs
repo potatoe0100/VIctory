@@ -6058,7 +6058,7 @@ mod window_tests {
         for (name, mb) in PRESETS_4060 {
             for (what, budget) in [("", reported), (", 1 GiB less free", reported.saturating_sub(1 << 30))] {
                 let (_, card) = resolve_card_limits(Some(budget), None, Some(mb));
-                let targets = crate::resource::targets_most(None, Some(budget));
+                let targets = crate::resource::targets_most(None, budget);
                 let floor = (2u64 << 30).min(budget / 4);
                 let line = crate::resource::room_line(budget);
                 eprintln!(
