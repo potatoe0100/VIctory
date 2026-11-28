@@ -479,7 +479,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size + card_pad());
+    let buffer = host.uav_buffer(size + pad_for(size, card_pad()));
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -494,11 +494,21 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// grimygunnz/nvidia-3070-VI 7c03013, after victory-merged 8528c08).
 /// `VICTORY_CARD_PAD_KB` (64; 0: none). The budget check sees it (the
 /// card's own count); the copies' MB limit does not.
+///
+/// A copy is given at most its own size of it, rounded up to 4 KiB
+/// ([`pad_for`]): with copies from 64 KiB up (play-nvidia.ps1) a full 64 KiB
+/// on each would double the small ones.
 fn card_pad() -> u64 {
     static PAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PAD.get_or_init(|| {
         std::env::var("VICTORY_CARD_PAD_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 10
     })
+}
+
+/// The pad of a card copy of `size` bytes: `pad`, at most `size` rounded up
+/// to 4 KiB.
+fn pad_for(size: u64, pad: u64) -> u64 {
+    pad.min(size.max(1).next_multiple_of(4096))
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -6354,6 +6364,15 @@ mod window_tests {
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
     }
 
+    #[test]
+    fn small_copies_are_padded_at_most_their_size() {
+        assert_eq!(super::pad_for(64 << 10, 64 << 10), 64 << 10);
+        assert_eq!(super::pad_for(1 << 20, 64 << 10), 64 << 10);
+        assert_eq!(super::pad_for(1000, 64 << 10), 4096);
+        assert_eq!(super::pad_for(0, 64 << 10), 4096);
+        assert_eq!(super::pad_for(1 << 20, 0), 0);
+    }
+
     /// `scripts/play-4060.ps1`'s presets: name and MiB of card buffer copies
     /// (keep in step with the script).
     const PRESETS_4060: [(&str, u64); 4] = [("balanced", 1024), ("safe", 512), ("fast", 1536), ("max", 2048)];
@@ -6375,8 +6394,10 @@ mod window_tests {
         for (name, mb) in PRESETS_4060 {
             for (what, budget) in [("", reported), (", 1 GiB less free", reported.saturating_sub(1 << 30))] {
                 let (_, card) = resolve_card_limits(Some(budget), None, Some(mb));
-                // The 64 KiB past each copy, at the most copies there can be
-                // (play-nvidia.ps1 copies buffers of 1 MiB and up).
+                // The 64 KiB past each copy of 1 MiB or more, at the most
+                // copies there can be. (Copies from 64 KiB up, play-nvidia.ps1,
+                // are padded at most their own size, `pad_for`; those under
+                // 1 MiB are nearly all copies but few bytes.)
                 let card = card + card / MIB * 64 * 1024;
                 let targets = crate::resource::targets_room_kept_bytes(Some(budget), None);
                 let floor = (2u64 << 30).min(budget / 4);

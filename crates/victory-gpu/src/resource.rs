@@ -2013,7 +2013,9 @@ pub(crate) const SMALL_CARD: u64 = 9 << 30;
 /// at 91 % down to 88 % (`crate::host::vram_keep`), a quarter again of the
 /// targets' peak kept for them ([`targets_kept_from_peak`]) and at most a
 /// sixteenth of the budget kept for card copies not made yet
-/// (`crate::shadow::card_room_kept`). `VICTORY_SMALL_CARD_LINES=0`: the lines
+/// (`crate::shadow::card_room_kept`). Off until the spill guard after
+/// edupode a0ead598 is in (without it an 8 GB card spilled 7 GB and crashed):
+/// `VICTORY_SMALL_CARD_LINES=1` turns it on; otherwise the lines
 /// of every card, as before.
 ///
 /// Why (RTX 4060, playability run of 2026-11-28, 6,248 MB budget): textures
@@ -2027,7 +2029,7 @@ pub(crate) fn small_card_lines(budget: u64) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     budget > 0
         && budget <= SMALL_CARD
-        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_none_or(|v| v != "0"))
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_some_and(|v| v == "1"))
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -5040,7 +5042,7 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(room_percent_for(Some(99), false), 97);
         assert_eq!(room_percent_for(Some(10), true), 50);
         const GIB: u64 = 1 << 30;
-        assert!(super::small_card_lines(6 * GIB) || std::env::var_os("VICTORY_SMALL_CARD_LINES").is_some());
+        assert_eq!(super::small_card_lines(6 * GIB), std::env::var_os("VICTORY_SMALL_CARD_LINES").is_some_and(|v| v == "1"));
         assert!(!super::small_card_lines(10 * GIB));
         assert!(!super::small_card_lines(0));
     }
