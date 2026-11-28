@@ -1912,11 +1912,20 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // The free part of the texture blocks counts as room only while the
+        // card is under its budget: it is mostly holes in blocks a quarter
+        // full or less, which new textures seldom fit, so they took new
+        // blocks while the card stood past its budget (edupode a0ead598,
+        // GPL-3.0: an RX 7600 8 GB at 8,315 MB in use of 6,610, 2,483 MB
+        // "free" in blocks, "room"; 7 GB moved into the PC's memory and the
+        // game ended). With the higher lines of small cards
+        // ([`small_card_lines`]) this is their floor.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept(Some(budget))
-                < room_line(budget)
+            used < budget
+                && used.saturating_sub(crate::pool::texture_room())
+                    + crate::shadow::card_room_kept()
+                    + targets_room_kept(Some(budget))
+                    < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2013,9 +2022,9 @@ pub(crate) const SMALL_CARD: u64 = 9 << 30;
 /// at 91 % down to 88 % (`crate::host::vram_keep`), a quarter again of the
 /// targets' peak kept for them ([`targets_kept_from_peak`]) and at most a
 /// sixteenth of the budget kept for card copies not made yet
-/// (`crate::shadow::card_room_kept`). Off until the spill guard after
-/// edupode a0ead598 is in (without it an 8 GB card spilled 7 GB and crashed):
-/// `VICTORY_SMALL_CARD_LINES=1` turns it on; otherwise the lines
+/// (`crate::shadow::card_room_kept`). With the room guard ([`room`]: the
+/// card under its budget, after edupode a0ead598) on by default;
+/// `VICTORY_SMALL_CARD_LINES=0`: the lines
 /// of every card, as before.
 ///
 /// Why (RTX 4060, playability run of 2026-11-28, 6,248 MB budget): textures
@@ -2029,7 +2038,7 @@ pub(crate) fn small_card_lines(budget: u64) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     budget > 0
         && budget <= SMALL_CARD
-        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_some_and(|v| v == "1"))
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_none_or(|v| v != "0"))
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -5042,7 +5051,7 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(room_percent_for(Some(99), false), 97);
         assert_eq!(room_percent_for(Some(10), true), 50);
         const GIB: u64 = 1 << 30;
-        assert_eq!(super::small_card_lines(6 * GIB), std::env::var_os("VICTORY_SMALL_CARD_LINES").is_some_and(|v| v == "1"));
+        assert_eq!(super::small_card_lines(6 * GIB), std::env::var_os("VICTORY_SMALL_CARD_LINES").is_none_or(|v| v != "0"));
         assert!(!super::small_card_lines(10 * GIB));
         assert!(!super::small_card_lines(0));
     }

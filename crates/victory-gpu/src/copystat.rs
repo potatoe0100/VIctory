@@ -828,7 +828,8 @@ fn log_memory() {
          outside buffers {:.0} MB; snapshot buffers kept: {} reserving {:.0} MB; staging of \
          textures: {} alive {:.0} MB, {} kept by their texture; host textures: {} alive {:.0} MB, \
          {} placed in title memory; made so far: {} upload buffers {:.0} MB, {} shared buffers \
-         {:.0} MB, {} card buffers {:.0} MB",
+         {:.0} MB, {} card buffers {:.0} MB; lists' upload buffers (VICTORY_UPLOAD_POOL): {} taken \
+         from those given back, {} made",
         mb(private),
         mb(working),
         mb(free),
@@ -851,6 +852,8 @@ fn log_memory() {
         mb(made[3]),
         made[4],
         mb(made[5]),
+        crate::host::UPLOAD_POOL_STATS[0].load(std::sync::atomic::Ordering::Relaxed),
+        crate::host::UPLOAD_POOL_STATS[1].load(std::sync::atomic::Ordering::Relaxed),
     );
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
