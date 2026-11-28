@@ -5508,12 +5508,34 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
-    if !fine() {
+    // nothing to choose: exactly `find`, unless [`hold`] lets a draw take a
+    // window of several cells that holds its range.
+    if !fine() && !hold() {
         return find(address, len);
     }
     lookup(address, len, true)
 }
+
+/// Whether a draw's ask on whole windows (the 4 MiB grid) takes a window
+/// already there that holds its whole range, the longest such, before one
+/// of its own cells is made (`VICTORY_WINDOW_HOLD=1`; off by default).
+/// An ask across a cell line makes a window of both cells, while asks
+/// inside each cell make one each: a 4060 run held 4,147 MiB of windows
+/// over 2,564 MiB of title memory (1,583 MiB in more than one window, each
+/// copied and compared once for each, 2026-11-28). A draw binds the copy it
+/// found and brings that copy up to date ([`find_any`]), so it may take
+/// any that holds it; the smaller windows it no longer takes go once idle.
+/// Off by default: what a shader wrote into one window reaches another
+/// only through title memory, frames later, so a draw reading vertices or
+/// arguments a compute pass wrote through another window may see old ones.
+fn hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_HOLD").is_some_and(|v| v == "1"))
+}
+
+/// How far below an ask [`hold`] looks for a window that began in a lower
+/// cell and reaches over it.
+const HOLD_REACH: u64 = 64 << 20;
 
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
@@ -5883,6 +5905,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    // A draw on whole windows ([`hold`]): the longest window there that holds
+    // the whole range, if any, under the readers' lock.
+    if any && !fine() && !unsized_ask && hold() {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let there = map.range((cell.saturating_sub(HOLD_REACH), 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        if let Some(key) = holder(there, address, end)
+            && let Some(shadow) = map.get(&key)
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
