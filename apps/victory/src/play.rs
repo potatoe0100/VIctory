@@ -66,6 +66,12 @@ const SETTINGS: &[(&str, &str)] = &[
     // the game it was slower, 17.4 frames a second against 19.0 on an RTX 4070 Ti SUPER, and it
     // held a menu back (#771). `--set VICTORY_CARD_AWAKE=1` turns it on.
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+    // Write faults open guarded blocks without the guards' lock, and a store that faults is done
+    // beside the guard (KyleS98/VIctory-Neo, prologue cell, RTX 3090 Ti: 29.87 -> 28.97 ms and
+    // 32.60 -> 31.17 ms a frame by turns; the lock-free race of #817 was fixed by #834).
+    // `--set VICTORY_FAULT_UNLOCKED=0` or `VICTORY_STORE_BESIDE=0` turns either off.
+    ("VICTORY_FAULT_UNLOCKED", "1"),
+    ("VICTORY_STORE_BESIDE", "1"),
     ("VICTORY_INDIRECT_WINDOW", "1"),
     ("VICTORY_INDIRECT_BATCH", "2"),
     ("VICTORY_UPLOAD_AHEAD", "1"),

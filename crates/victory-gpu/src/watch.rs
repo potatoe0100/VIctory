@@ -3296,11 +3296,45 @@ pub(crate) fn install() {
     });
 }
 
+/// The protection of the one page `at` lies in, where the system has that
+/// page in memory (`None`: it has not, or would not say).
+///
+/// `VirtualQuery` answers for the whole run of pages around an address that
+/// are alike, and walks to the end of it to say how long it is: for a view of
+/// hundreds of megabytes whose blocks are all read-only, hundreds of
+/// microseconds with the address space held against every change of
+/// protection. A write fault of the title's on a block that another of its
+/// threads is opening asked so ([`writable`]): 91 such questions a frame of
+/// 245 microseconds each, 22 ms a frame of the title's threads' time, and the
+/// openings themselves (a change of protection each) 235 microseconds behind
+/// them; 3.2 ms of every frame's chain (a timeline of the prologue's cell at
+/// 38 frames a second, RTX 3090 Ti, Ryzen 9 9950X3D). This asks about one
+/// page and walks nothing. `VICTORY_PAGE_ASK=0`: the region, as before.
+fn page_protection(at: usize) -> Option<u32> {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if !crate::toggled!("VICTORY_PAGE_ASK") {
+        return None;
+    }
+    // SAFETY: plain data, the address asked about in it.
+    let mut info: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
+    info.VirtualAddress = at as *mut _;
+    // SAFETY: our own process; an array of one record of that size.
+    let ok = unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), std::ptr::from_mut(&mut info).cast(), size_of_val(&info) as u32) } != 0;
+    // SAFETY: every form of the answer is these bits.
+    let flags = unsafe { info.VirtualAttributes.Flags };
+    // Bit 0: the page is in memory; bits 4 to 14: its protection then.
+    (ok && flags & 1 != 0).then(|| ((flags >> 4) & 0x7ff) as u32)
+}
+
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };
+    if let Some(protection) = page_protection(at) {
+        return protection == PAGE_READWRITE;
+    }
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.

@@ -54,9 +54,16 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
 - NV #953: an upload is tried again after scratch is freed (a load crash on a 4060 Laptop).
 - NV #927: VICTORY_CARD_AWAKE no longer set (19.0 against 17.4 fps).
 - NV #919: library saves no longer hold new pipelines back.
-- The spare pool keeps the newest chunks (`VICTORY_SPARE_NEWEST=0` backs out).
+- The spare pool keeps the newest chunks (replaced by NV #973 at 10 PM).
 - Melsinus: title windows on the card from a 6 GiB budget, about 646 MB (`VICTORY_CARD_WINDOWS_MB=0` backs out; our
   launcher's 768 still overrides it).
+
+## 10 PM picks
+
+- NV #999: aliasing barriers only for pooled textures (the 16 MiB blocks hit its E_INVALIDARG failure without it).
+- NV #991: small upload and shared buffers cut from 64 MiB blocks. NV #973 (replaces the 9 PM spare-newest change).
+- NV #970: faces on the first start. NV #1003: AVX2 streaming stores. NV #1007: more descriptor slots. NV #971, #972.
+- KyleS98: retired queues per thread (`VICTORY_FAULT_UNLOCKED=1` and `VICTORY_STORE_BESIDE=1` set in play.rs).
 
 ## Intel (off by default)
 
