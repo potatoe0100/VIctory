@@ -47,6 +47,17 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
   refill churn (`VICTORY_SMALL_CARD=0` backs out). The max preset no longer fits under that line with 1 GiB of the
   card used elsewhere; the budget test prints it but holds only safe, balanced and fast.
 
+## 9 PM picks
+
+- NV #938: faces' shared memory (faces drawn as eyes and teeth). Changes the shader cache key: the first start
+  re-translates.
+- NV #953: an upload is tried again after scratch is freed (a load crash on a 4060 Laptop).
+- NV #927: VICTORY_CARD_AWAKE no longer set (19.0 against 17.4 fps).
+- NV #919: library saves no longer hold new pipelines back.
+- The spare pool keeps the newest chunks (`VICTORY_SPARE_NEWEST=0` backs out).
+- Melsinus: title windows on the card from a 6 GiB budget, about 646 MB (`VICTORY_CARD_WINDOWS_MB=0` backs out; our
+  launcher's 768 still overrides it).
+
 ## Intel (off by default)
 
 - `VICTORY_SUBMIT_CORE=1`: the submitting thread gets a fast physical core to itself (2: the process's other
@@ -58,7 +69,7 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
 `scripts/play-4060.ps1`: play-foxhound.ps1 with the Series S profile, its own upscaling, `-Preset
 safe|balanced|fast|max` (512 to 2048 MB of buffer copies; a test checks they fit the card's budget), and the
 settings 8 GB users measured: `VICTORY_PORT_CONSTANTS=1`, `VICTORY_CARD_WINDOWS_MB=768`, `VICTORY_THIN_THREADS=4`,
-`VICTORY_CARD_AWAKE=0`.
+and the card not kept awake (unset since NV #927).
 
 ## Other
 

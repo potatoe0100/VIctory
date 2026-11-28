@@ -23,9 +23,9 @@ $settings = @{
     # on the card (about +15 %).
     VICTORY_PORT_CONSTANTS = '1'
     VICTORY_CARD_WINDOWS_MB = '768'
-    # Helped on a 6-core Intel PC (VIctory-NVIDIA #526): four list threads, and the card not kept awake.
+    # Helped on a 6-core Intel PC (VIctory-NVIDIA #526): four list threads. (The card is not kept awake: since
+    # VIctory-NVIDIA #927 play-foxhound.ps1 leaves VICTORY_CARD_AWAKE unset.)
     VICTORY_THIN_THREADS = '4'
-    VICTORY_CARD_AWAKE = '0'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $foxhound = @{ Exe = $Exe; Build = $Build; SeriesS = $true; Dlss = 'off'; More = $settings }

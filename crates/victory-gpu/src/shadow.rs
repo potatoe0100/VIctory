@@ -523,14 +523,20 @@ fn window_card_most() -> u64 {
 }
 
 /// The default of [`window_card_most`], in MiB, from the card's budget in
-/// bytes: none when it is not known; 9% of it, at most 1024 MiB, from 8 GiB
+/// bytes: none when it is not known; 9% of it, at most 1024 MiB, from 6 GiB
 /// on. 1024 on an RTX 4070 SUPER (budget 11,229 MB), with the copies of title
 /// buffers at 2048 ([`default_card_limits_mb`]), moved the reads of the
 /// title's allocator off the bus: the release build's gameplay went from
 /// 3 to 21-25 fps (2026-11-26, log coolfox-20261126-140546).
+///
+/// It began at 8 GiB, which no card of 8 GB reaches (an RTX 5060: 7,127 MB at
+/// the start), so on those every window stayed in the PC's memory, read over
+/// the bus at every draw (`window_card_mb=0` in each run of 2026-11-28). On
+/// such a card the texture queue's line gives way to them
+/// (`resource::small_card`): what they take is taken from textures.
 fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
     match local_vram_budget.map(|b| b >> 20) {
-        Some(mb) if mb >= 8 * 1024 => (mb * 9 / 100).min(1024),
+        Some(mb) if mb >= 6 * 1024 => (mb * 9 / 100).min(1024),
         _ => 0,
     }
 }
@@ -6021,7 +6027,10 @@ mod window_tests {
     fn window_room_follows_the_budget() {
         const GIB: u64 = 1 << 30;
         assert_eq!(super::default_window_card_mb(None), 0);
-        assert_eq!(super::default_window_card_mb(Some(6 * GIB)), 0);
+        assert_eq!(super::default_window_card_mb(Some(5 * GIB)), 0);
+        assert_eq!(super::default_window_card_mb(Some(6 * GIB)), 552);
+        // An RTX 5060 of 8 GB, its budget at the start.
+        assert_eq!(super::default_window_card_mb(Some(7127 << 20)), 641);
         assert_eq!(super::default_window_card_mb(Some(8 * GIB)), 737);
         assert_eq!(super::default_window_card_mb(Some(11229 << 20)), 1010);
         assert_eq!(super::default_window_card_mb(Some(24 * GIB)), 1024);
