@@ -314,8 +314,28 @@ pub(crate) fn card_room_kept() -> u64 {
     // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let budget = *BUDGET.get_or_init(|| crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget));
+    card_room_kept_bytes(
+        card_limits().1,
+        CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed),
+        budget.filter(|&b| crate::resource::small_card_lines(b)),
+    )
+}
+
+/// [`card_room_kept`]: of `most` bytes of card copies, at most 1 GiB (no
+/// session's came to more), less `taken` (made, or refused for good); on a
+/// small card (`small_budget`, its budget: `crate::resource::small_card_lines`)
+/// also at most a sixteenth of the budget. On an RTX 4060 (6,248 MB budget,
+/// the balanced preset's 1,024 MB of copies) the whole unused part of the
+/// copies' budget was kept from the textures, which then waited for room
+/// with about 700 MB of the card free (2026-11-28); a sixteenth is 390 MB.
+/// Copies that do not find room stay in the PC's memory, as copies past
+/// `most` always did.
+fn card_room_kept_bytes(most: u64, taken: u64, small_budget: Option<u64>) -> u64 {
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    let cap = small_budget.map_or(SEEN, |budget| SEEN.min(budget / 16));
+    most.min(cap).saturating_sub(taken)
 }
 
 /// The copies in the card's memory.
@@ -710,6 +730,8 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
+    // (A window may stand under several names.)
+    all.dedup_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
     let turn = all.partition_point(|s| s.id < next);
     let mut done = 0;
@@ -3261,16 +3283,25 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        // A copy under several names is held by the table once for each:
+        // idle when nothing else holds it, and then all its names go.
+        let names = names_of(map.iter().map(|(key, s)| (*key, Arc::as_ptr(s) as usize)));
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
+                let held = names.get(&(Arc::as_ptr(s) as usize)).map_or(1, Vec::len);
+                Arc::strong_count(s) == held
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        // One of each copy (the others are its other names).
+        let mut seen = std::collections::HashSet::new();
+        idle.into_iter()
+            .filter_map(|key| map.remove(&key))
+            .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+            .collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -3285,6 +3316,16 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+}
+
+/// The names (keys) each copy of `windows` (name, the copy's address) stands
+/// under, by the copy's address.
+fn names_of(windows: impl Iterator<Item = ((u64, u64), usize)>) -> std::collections::HashMap<usize, Vec<(u64, u64)>> {
+    let mut names: std::collections::HashMap<usize, Vec<(u64, u64)>> = std::collections::HashMap::new();
+    for (key, at) in windows {
+        names.entry(at).or_default().push(key);
+    }
+    names
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
@@ -5930,7 +5971,40 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
-/// Copies of title memory outside buffers, by (start, length).
+/// Whether a window an ask would make that lies within a window there
+/// already is that window instead ([`container`]): `VICTORY_WINDOW_ALIAS=0`
+/// makes a copy of its own, as before.
+///
+/// Windows are named by their asks: a root view's (its cell and the
+/// committed memory after it, [`reaching`]), an ask with a length (the
+/// cells it touches), each a copy of its own, filled and brought up to date
+/// on its own. The same title memory lay in several: 4,147 MiB of windows
+/// over 2,564 MiB of title memory in a run of 2026-11-28 (RTX 4060), each
+/// byte of the 1.58 GiB between copied once more for each window.
+fn contained_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_ALIAS").is_none_or(|v| v != "0"))
+}
+
+/// How far below a new window's start windows are looked for that may hold
+/// it ([`container`]).
+const CONTAINER_REACH: u64 = 64 << 20;
+
+/// Windows asked for that another window stood for ([`contained_windows`])
+/// since the start, and their bytes (the copies not made).
+pub(crate) static CONTAINED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Of `windows` (start, bytes), the one that holds all of `[start, start +
+/// len)`: the longest, and of those the lowest. `None` if none does.
+fn container(windows: impl Iterator<Item = (u64, u64)>, start: u64, len: u64) -> Option<(u64, u64)> {
+    let end = start.checked_add(len)?;
+    windows
+        .filter(|&(at, bytes)| at <= start && at.saturating_add(bytes) >= end)
+        .max_by_key(|&(at, bytes)| (bytes, std::cmp::Reverse(at)))
+}
+
+/// Copies of title memory outside buffers, by (start, length). A copy may
+/// stand under several names ([`contained_windows`]).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, reach: bool) -> Option<Arc<Shadow>> {
@@ -5983,6 +6057,27 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, reach: bool) -> O
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
+    }
+    // A window that holds all of this one already: it stands for this one
+    // too, under this one's name, so that the next ask of the name finds the
+    // same copy ([`contained_windows`]).
+    if contained_windows()
+        && !(unsized_ask && tails())
+        && let Some(key) = container(
+            map.range((start.saturating_sub(CONTAINER_REACH), 0)..=(start, u64::MAX)).map(|(_, s)| (s.start, s.len)),
+            start,
+            len,
+        )
+        && let Some(shadow) = map.get(&key).cloned()
+    {
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        let n = CONTAINED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CONTAINED[1].fetch_add(len, Ordering::Relaxed) + len;
+        if n.is_power_of_two() {
+            tracing::info!(windows = n, mb = bytes >> 20, "windows of title memory another window held: no copy of their own (VICTORY_WINDOW_ALIAS=0: copies of their own)");
+        }
+        return Some(shadow);
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
@@ -6245,6 +6340,12 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
         assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
         assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
+        // The room kept for card copies not made yet: at most 1 GiB, and a
+        // sixteenth of an 8 GB card's budget.
+        assert_eq!(super::card_room_kept_bytes(1024 * MIB, 0, None), 1024 * MIB);
+        assert_eq!(super::card_room_kept_bytes(2048 * MIB, 100 * MIB, None), 924 * MIB);
+        assert_eq!(super::card_room_kept_bytes(1024 * MIB, 0, Some(6248 * MIB)), 390 * MIB + 512 * 1024);
+        assert_eq!(super::card_room_kept_bytes(1024 * MIB, 500 * MIB, Some(6248 * MIB)), 0);
 
         // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
         assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
@@ -6316,6 +6417,39 @@ mod window_tests {
         // Of two as long, the one that begins lower.
         let two = [(cell + 0x8_0000, 0x8_0000), (cell + 0x4_0000, 0x8_0000)];
         assert_eq!(holder(two.into_iter(), ask, end), Some((cell + 0x4_0000, 0x8_0000)));
+    }
+
+    /// A window an ask would make is a window there already that holds all
+    /// of it: a root view's longer window holds a 4 MiB cell's, a window of
+    /// three cells holds one of its middle cell; one that holds only a part
+    /// does not.
+    #[test]
+    fn a_window_within_another_is_that_window() {
+        use super::container;
+        const CELL: u64 = 4 << 20;
+        let a = 0x2_4000_0000u64;
+        assert_eq!(container([].into_iter(), a, CELL), None);
+        // A root view's window: its cell and 1.5 MiB more.
+        let reaching = (a, CELL + (3 << 19));
+        assert_eq!(container([reaching].into_iter(), a, CELL), Some(reaching));
+        // Three cells hold their middle one; the longest of two that do.
+        let three = (a, 3 * CELL);
+        assert_eq!(container([reaching, three].into_iter(), a + CELL, CELL), Some(three));
+        assert_eq!(container([reaching, three].into_iter(), a, CELL), Some(three));
+        // Part of it only (the cell after the root view's reach), or after it.
+        assert_eq!(container([reaching].into_iter(), a + CELL, CELL), None);
+        assert_eq!(container([(a + CELL, CELL)].into_iter(), a, CELL), None);
+        // No overflow at the top of the address space.
+        assert_eq!(container([(a, CELL)].into_iter(), u64::MAX - 1, CELL), None);
+    }
+
+    /// The names a copy stands under, gathered by the copy.
+    #[test]
+    fn a_copy_under_several_names_is_counted_once() {
+        let names = super::names_of([((1, 4), 10), ((1, 8), 10), ((9, 4), 20)].into_iter());
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[&10], vec![(1, 4), (1, 8)]);
+        assert_eq!(names[&20], vec![(9, 4)]);
     }
 
     /// What windows lie over counts each byte once.

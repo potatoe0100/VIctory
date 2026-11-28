@@ -146,19 +146,29 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_for(budget, used, crate::resource::small_card_lines(budget))
+}
+
+/// [`vram_keep`] with its lines: on a small card (`small`,
+/// `crate::resource::small_card_lines`) from 91 % down to 88 %, and 96 %
+/// for the short wait, so that the sweep's line sits under the texture line
+/// (94 % there) with a gap: at 88 % against a texture line of 90 % the sweep
+/// on an 8 GB card let idle copies go the whole run (2026-11-28).
+fn vram_keep_for(budget: u64, used: u64, small: bool) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
+    let (keep, down, short) = if small { (91, 88, 96) } else { (88, 85, 95) };
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(keep) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(short) {
+        (IDLE_MS, used - share(down))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(down))
     }
 }
 
@@ -11497,7 +11507,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        let vram_keep = |budget, used| super::vram_keep_for(budget, used, false);
         let gib = 1 << 30;
         assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
@@ -11505,6 +11515,16 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    /// A small card's sweep: kept up to 91 %, then down to 88 %.
+    #[test]
+    fn small_cards_sweep_from_91_percent() {
+        let gib = 1u64 << 30;
+        let keep = |used| super::vram_keep_for(100 * gib, used, true);
+        assert_eq!(keep(90 * gib).0, 600_000);
+        assert_eq!(keep(92 * gib), (5_000, 4 * gib));
+        assert_eq!(keep(97 * gib), (1_500, 9 * gib));
     }
 
     #[test]

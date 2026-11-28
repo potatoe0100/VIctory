@@ -121,6 +121,10 @@ impl Made {
     }
 }
 
+/// Since the start: made texture slots [`HostHeap::sweep_away_slots`] looked
+/// at, and those it made null for their memory was gone.
+pub(crate) static SWEPT_AWAY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -156,6 +160,8 @@ pub(crate) struct HostHeap {
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
     away: Mutex<crate::fx::Map<u32, (u64, u64)>>,
+    /// Where [`HostHeap::sweep_away_slots`] looks next.
+    sweep_from: std::sync::atomic::AtomicU32,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -1823,6 +1829,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
+            sweep_from: std::sync::atomic::AtomicU32::new(0),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: {
                 let mut words = vec![0u64; (extra as usize).div_ceil(64)];
@@ -2399,6 +2406,81 @@ impl HostHeap {
         self.unmake(index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// While the card is pressed (`crate::resource::sweep_pressed`): made
+    /// texture slots are looked at again, a part at a time, whether or not
+    /// they wait in the queue. One whose title memory is not mapped any more
+    /// is made null ([`HostHeap::texture_slot_gone`], after its `AWAY_MS`) so
+    /// that its host copy can go (`crate::resource::let_go_idle`, which takes
+    /// only copies no slot holds), and put back in the queue
+    /// ([`TextureQueue::requeue`]) to be made again when its memory comes
+    /// back. Returns the slots looked at and those made null.
+    ///
+    /// Why: a slot leaves the queue once its texture is uploaded and looked
+    /// at a few times (`RECHECK_FRAMES`, about 400 frames), and only the
+    /// queue's slots were ever found away. A texture the title streamed out
+    /// after that kept its host copy for the rest of the run, through its
+    /// slot: on an 8 GB card the copies the sweep could let go were only the
+    /// few no slot held, and new textures waited for room (2026-11-28).
+    /// `VICTORY_SWEEP_AWAY_SLOTS=0`: not done, as before.
+    pub(crate) fn sweep_away_slots(&self, frame: u64) -> [u64; 2] {
+        // Slots gone through a call (an atomic load each), and of them the
+        // made texture slots whose mapping is asked.
+        const SCAN: u32 = 1 << 16;
+        const LOOK: u64 = 256;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.sampler
+            || self.count == 0
+            || !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_AWAY_SLOTS").is_none_or(|v| v != "0"))
+        {
+            return [0, 0];
+        }
+        let mut i = self.sweep_from.load(Ordering::Relaxed);
+        if i >= self.count {
+            i = 0;
+        }
+        let end = i.saturating_add(SCAN).min(self.count);
+        let (mut looked, mut gone) = (0u64, 0u64);
+        let mut back = Vec::new();
+        while i < end && looked < LOOK {
+            let index = i;
+            i += 1;
+            let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
+                continue;
+            };
+            if !self.holds(index) {
+                continue;
+            }
+            let Some(View::Placed(false, resource, desc)) = view_at(key as u32, (key >> 32) as u32) else {
+                continue;
+            };
+            looked += 1;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let first = crate::resource::first_mip(&desc);
+            let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
+            if crate::texture::mapped_bytes(address as *const u8, len as usize) > 0 {
+                self.texture_slot_here(index);
+            } else if self.texture_slot_gone(index) {
+                gone += 1;
+                back.push(index);
+            }
+        }
+        self.sweep_from.store(if i >= self.count { 0 } else { i }, Ordering::Relaxed);
+        if !back.is_empty() {
+            self.texture_slots_requeue(&back, frame);
+        }
+        SWEPT_AWAY[0].fetch_add(looked, Ordering::Relaxed);
+        let before = SWEPT_AWAY[1].fetch_add(gone, Ordering::Relaxed);
+        // The first, and each doubling.
+        if gone > 0 && (before == 0 || (before + gone).ilog2() != before.ilog2()) {
+            tracing::info!(
+                slots = before + gone,
+                looked = SWEPT_AWAY[0].load(Ordering::Relaxed),
+                "texture slots whose memory went made null for their host copies to go (VICTORY_SWEEP_AWAY_SLOTS=0: kept)"
+            );
+        }
+        [looked, gone]
     }
 
     /// Whether host slot `index` shows the placed texture the title's record

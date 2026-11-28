@@ -2554,6 +2554,17 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room(memory);
+        // Past the sweep's line: made slots whose memory went are found and
+        // made null, so their host copies can go (`sweep_away_slots`), at
+        // most four times a second.
+        {
+            static SWEPT: AtomicU64 = AtomicU64::new(0);
+            let now = crate::host::now_ms();
+            if now >= SWEPT.load(Ordering::Relaxed) + 250 && (!room || crate::resource::sweep_pressed(memory)) {
+                SWEPT.store(now, Ordering::Relaxed);
+                host.sweep_away_slots(frame);
+            }
+        }
         // A bake draw's own textures (`State::early_textures`), and whether
         // this run is for them alone: then nothing of the queue's upkeep is
         // done, which a pass of this frame did or will do.

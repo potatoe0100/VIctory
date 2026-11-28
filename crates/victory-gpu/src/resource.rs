@@ -1916,9 +1916,26 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
             used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept(Some(budget))
-                < budget / 100 * room_percent()
+                < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
+    }
+}
+
+/// Whether the card is past the line from which the sweep lets idle host
+/// copies of textures go (`crate::host::vram_keep`), counted as
+/// [`let_go_idle`] counts it: then made texture slots whose memory went are
+/// looked for too (`HostHeap::sweep_away_slots`).
+#[cfg(windows)]
+pub(crate) fn sweep_pressed(memory: Option<[u64; 4]>) -> bool {
+    match memory {
+        Some([budget, used, ..]) => {
+            let used = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept(Some(budget));
+            crate::host::vram_keep(budget, used).1 != u64::MAX
+        }
+        None => false,
     }
 }
 
@@ -1963,12 +1980,16 @@ pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     // (`targets_kept_from_peak`), unless the switch above set it flat.
     static PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let peak = PEAK.fetch_max(targets, Relaxed).max(targets);
-    targets_kept_from_peak(most, targets, peak)
+    targets_kept_from_peak(most, targets, peak, vram_budget.is_some_and(small_card_lines))
 }
 
 /// What [`targets_room_kept`] keeps of `most` without the switch: half as
 /// much again as the targets have held at their most (`peak`), and at least
-/// 256 MiB, never more than `most` (VIctory-NVIDIA PR #76, 05a269d8).
+/// 256 MiB, never more than `most` (VIctory-NVIDIA PR #76, 05a269d8). On a
+/// card of [`SMALL_CARD`] or less (`small`, [`small_card_lines`]): a quarter
+/// again, and at least 128 MiB. A run's targets reach their peak in the
+/// world's first frames and stay there; the half again was room for growth
+/// that every texture on a 6.2 GB budget was refused for.
 ///
 /// Measured there on an 8 GB card (RTX 4060 Laptop, 2026-11-27): the
 /// targets of a 720p world held 390 MB, so the flat reserve kept 2,675 MB
@@ -1976,10 +1997,37 @@ pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
 /// card 41 % used, and passers-by's skin textures were never uploaded (black
 /// faces). Sized by the peak, the same run keeps 195 MB.
 #[cfg(any(windows, test))]
-fn targets_kept_from_peak(most: u64, targets: u64, peak: u64) -> u64 {
-    /// Room for targets to grow into while they are still being made.
-    const LEAST: u64 = 256 << 20;
-    peak.saturating_add(peak / 2).max(LEAST).min(most).saturating_sub(targets)
+fn targets_kept_from_peak(most: u64, targets: u64, peak: u64, small: bool) -> u64 {
+    // Room for targets to grow into while they are still being made.
+    let (least, more) = if small { (128 << 20, peak / 4) } else { (256 << 20, peak / 2) };
+    peak.saturating_add(more).max(least).min(most).saturating_sub(targets)
+}
+
+/// The budgets of 8 GB cards (an RTX 4060 reports 6.2 to 7.2 GB, less what
+/// other programs hold) and below.
+#[cfg(any(windows, test))]
+pub(crate) const SMALL_CARD: u64 = 9 << 30;
+
+/// Whether the card's lines and reserves are the small card's
+/// ([`SMALL_CARD`]): the texture line at 94 % ([`room_percent`]), the sweep's
+/// at 91 % down to 88 % (`crate::host::vram_keep`), a quarter again of the
+/// targets' peak kept for them ([`targets_kept_from_peak`]) and at most a
+/// sixteenth of the budget kept for card copies not made yet
+/// (`crate::shadow::card_room_kept`). `VICTORY_SMALL_CARD_LINES=0`: the lines
+/// of every card, as before.
+///
+/// Why (RTX 4060, playability run of 2026-11-28, 6,248 MB budget): textures
+/// picked by index waited for room at 5,529 MB in use. At 90 % with both
+/// reserves counted as used (up to 1 GB for card copies, half again the
+/// targets' peak) the queue stopped at about 5.2 to 5.5 GB, and the sweep,
+/// which let idle copies go from 88 % with the same reserves, sat on its line
+/// the whole run: copies let go after 5 s idle and uploaded again.
+#[cfg(any(windows, test))]
+pub(crate) fn small_card_lines(budget: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    budget > 0
+        && budget <= SMALL_CARD
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_none_or(|v| v != "0"))
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2012,18 +2060,23 @@ pub(crate) fn room_lately() -> bool {
 /// PR #340).
 #[cfg(windows)]
 pub(crate) fn room_line(budget: u64) -> u64 {
-    budget / 100 * room_percent()
+    budget / 100 * room_percent(budget)
 }
 
 #[cfg(windows)]
-fn room_percent() -> u64 {
-    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
-    })
+fn room_percent(budget: u64) -> u64 {
+    static PERCENT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT").ok().and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    room_percent_for(set, small_card_lines(budget))
+}
+
+/// [`room_percent`]: `set` (50 to 97) if given, else 94 on a small card
+/// ([`small_card_lines`]) and 90 on others.
+#[cfg(any(windows, test))]
+fn room_percent_for(set: Option<u64>, small: bool) -> u64 {
+    set.map_or(if small { 94 } else { 90 }, |percent| percent.clamp(50, 97))
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -4951,15 +5004,45 @@ float4 lit() : SV_Target { return 1.0; }
         let most = 3072 * MIB;
         // The SeriesS profile on an 8 GB card: the targets stay at 390 MB,
         // and 195 MB is kept where the flat reserve kept 2,682 MB.
-        assert_eq!(targets_kept_from_peak(most, 390 * MIB, 390 * MIB), 195 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 390 * MIB, 390 * MIB, false), 195 * MIB);
         // A world's first frames: half as much again as their peak so far.
-        assert_eq!(targets_kept_from_peak(most, 650 * MIB, 650 * MIB), 325 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 650 * MIB, 650 * MIB, false), 325 * MIB);
         // 1440p: the peak passes what the switch allows; never more than it.
-        assert_eq!(targets_kept_from_peak(most, 2900 * MIB, 2900 * MIB), 172 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 2900 * MIB, 2900 * MIB, false), 172 * MIB);
         // A scene's targets given back: the peak still holds what they may want.
-        assert_eq!(targets_kept_from_peak(most, 0, 2900 * MIB), most);
+        assert_eq!(targets_kept_from_peak(most, 0, 2900 * MIB, false), most);
         // Nothing made yet: at least 256 MiB.
-        assert_eq!(targets_kept_from_peak(most, 0, 0), 256 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 0, 0, false), 256 * MIB);
+    }
+
+    /// On an 8 GB card: a quarter again of the peak, at least 128 MiB, and
+    /// never more than the cap (a quarter of the budget there).
+    #[test]
+    fn small_cards_keep_less_for_targets() {
+        const MIB: u64 = 1 << 20;
+        let most = super::targets_room_kept_bytes(Some(6248 * MIB), None);
+        assert_eq!(most, 1562 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 400 * MIB, 400 * MIB, true), 100 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 0, 0, true), 128 * MIB);
+        assert_eq!(targets_kept_from_peak(most, 0, 1600 * MIB, true), most);
+        // Against the old keep, 100 MB more for textures at a 400 MB peak.
+        assert_eq!(targets_kept_from_peak(most, 400 * MIB, 400 * MIB, false), 200 * MIB);
+    }
+
+    /// The texture line: 94 % on cards of 9 GiB or less, 90 % on others, and
+    /// what `VICTORY_TEXTURE_ROOM_PERCENT` says (50 to 97) on any.
+    #[test]
+    fn small_cards_make_textures_up_to_94_percent() {
+        use super::room_percent_for;
+        assert_eq!(room_percent_for(None, true), 94);
+        assert_eq!(room_percent_for(None, false), 90);
+        assert_eq!(room_percent_for(Some(80), true), 80);
+        assert_eq!(room_percent_for(Some(99), false), 97);
+        assert_eq!(room_percent_for(Some(10), true), 50);
+        const GIB: u64 = 1 << 30;
+        assert!(super::small_card_lines(6 * GIB) || std::env::var_os("VICTORY_SMALL_CARD_LINES").is_some());
+        assert!(!super::small_card_lines(10 * GIB));
+        assert!(!super::small_card_lines(0));
     }
 
     /// A placed texture viewed from a later level has a host copy of that
