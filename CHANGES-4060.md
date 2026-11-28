@@ -6,9 +6,11 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
 ## 8 GB card (each has a switch)
 
 - Small-card lines, off until measured (`VICTORY_SMALL_CARD_LINES=1`): on budgets of 9 GiB or less the texture line
-  94 %, render-target room at most a quarter of the budget, room for card buffer copies at most a sixteenth.
+  94 % and room for card buffer copies at most a sixteenth of the budget.
 - Bindless feedback (skornuta, `VICTORY_BINDLESS_FEEDBACK=1` set by play.rs): NV's slot eviction may drop textures
   picked by index that no shader has read for 60 s.
+- Render-target room at most a quarter of the budget on cards of 9 GiB or less (3,072 MiB was half of a 4060's
+  6.2 GB budget; the 8 GB presets did not fit it with 1 GiB of the card used by other programs).
 - Texture room only while the card is under its budget (edupode a0ead598): free parts of mostly empty blocks no
   longer count as room once the card is past it.
 - List upload buffers pooled (edupode 62bba05, `VICTORY_UPLOAD_POOL=0` backs out).

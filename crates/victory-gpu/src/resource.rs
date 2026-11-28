@@ -2026,7 +2026,8 @@ pub(crate) fn targets_room_kept() -> u64 {
 
 /// The most [`targets_room_kept`] keeps: `VICTORY_CARD_ROOM_FOR_TARGETS_MB`
 /// (`set`, at most 8,192) if given, else 3,072 MiB, at most a quarter of
-/// the budget on a small card ([`small_card_lines`]): on an RTX 4060's
+/// the budget on a card of [`SMALL_CARD`] or less (as MiniVI kept it; not
+/// part of [`small_card_lines`]): on an RTX 4060's
 /// 6.2 GB budget 3,072 MiB was half of it, and the textures picked by index
 /// waited for room with the card 41 % used (2026-11-27).
 #[cfg(any(windows, test))]
@@ -2034,7 +2035,7 @@ pub(crate) fn targets_most(set: Option<u64>, budget: Option<u64>) -> u64 {
     const MOST: u64 = 3072 << 20;
     match (set, budget) {
         (Some(mb), _) => mb.min(8192) << 20,
-        (None, Some(budget)) if small_card_lines(budget) => MOST.min(budget / 4),
+        (None, Some(budget)) if budget > 0 && budget <= SMALL_CARD => MOST.min(budget / 4),
         _ => MOST,
     }
 }
@@ -5344,9 +5345,7 @@ float4 lit() : SV_Target { return 1.0; }
     fn small_cards_keep_less_for_targets() {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
-        if small_card_lines(8 * GIB) {
-            assert_eq!(targets_most(None, Some(6248 * MIB)), 6248 * MIB / 4);
-        }
+        assert_eq!(targets_most(None, Some(6248 * MIB)), 6248 * MIB / 4);
         assert_eq!(targets_most(None, Some(16 * GIB)), 3072 * MIB);
         assert_eq!(targets_most(None, None), 3072 * MIB);
         assert_eq!(targets_most(Some(512), Some(6 * GIB)), 512 * MIB);
