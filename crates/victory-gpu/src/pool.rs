@@ -1184,9 +1184,13 @@ mod tests {
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
 
-        let budgets = [(1u64, SPARE), (8, 4), (12, 6), (16, 8), (24, 12), (256, SPARE_KEPT)];
-        for (gib, scaled) in budgets {
+        // Scaled: a thirty-second of the budget in blocks of this card's size
+        // (16 MiB on budgets up to 8.5 GiB, else 64: `texture_block`), so
+        // the counts follow the block size (with 64 MiB blocks 2, 4, 6, 8,
+        // 12 and 64).
+        for gib in [1u64, 8, 12, 16, 24, 256] {
             let budget = gib << 30;
+            let scaled = ((budget / 32 / texture_block()).clamp(SPARE as u64, SPARE_KEPT as u64)) as usize;
             for (percent, legacy, expected) in [
                 (84, SPARE_KEPT, scaled),
                 (85, SPARE, SPARE),
