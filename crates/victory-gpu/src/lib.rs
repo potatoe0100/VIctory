@@ -32,6 +32,8 @@ mod faultbook;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;
+#[cfg(windows)]
+mod feedback;
 pub mod device;
 #[cfg(windows)]
 mod draw;

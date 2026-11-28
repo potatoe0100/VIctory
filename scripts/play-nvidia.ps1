@@ -58,6 +58,10 @@ $settings = @{
     VICTORY_CARD_BUFFERS_MIN_KB = '64'; VICTORY_CARD_BUFFERS_MB = '1536'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
+    # Memory stack (skornuta, via VIctory-NVIDIA): idle textures shown by table slots are let go above 85 % of the
+    # card's budget, and with the bindless feedback the indexed ones no shader read for 60 s too (resource.rs
+    # slot_evict, feedback.rs). The feedback changes every texture-sampling shader: the cache warms again once.
+    VICTORY_SLOT_EVICT = '1'; VICTORY_BINDLESS_FEEDBACK = '1'
 }
 # Ray tracing mostly off. The structure builder cannot run on NVIDIA (its 64-lane programs are refused; upstream
 # Marvisak/VIctory pull request 2311), so every ray misses, and the passes that turn misses into light made rooms go
