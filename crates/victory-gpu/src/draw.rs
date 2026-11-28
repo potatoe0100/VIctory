@@ -669,29 +669,77 @@ fn heap_spread() -> bool {
 
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
-#[derive(Default)]
-struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
+struct HeapRanges<T> {
+    /// Index into `dense` per slot (`u32::MAX` = empty).
+    index: Vec<u32>,
+    /// Tightly packed `(slot, (T, from, to))` for active slots only.
+    dense: Vec<(u32, (T, u64, u64))>,
+}
+
+impl<T> Default for HeapRanges<T> {
+    fn default() -> Self {
+        Self { index: Vec::new(), dense: Vec::new() }
+    }
+}
 
 impl<T> HeapRanges<T> {
-    fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
-        let slot = slot as usize;
-        if range.is_none() && slot >= self.0.len() {
+    fn clear(&mut self) {
+        self.index.fill(u32::MAX);
+        self.dense.clear();
+    }
+
+    fn remove(&mut self, slot: usize) {
+        if slot >= self.index.len() {
             return;
         }
-        if slot >= self.0.len() {
-            self.0.resize_with(slot + 1, || None);
+        let idx = self.index[slot];
+        if idx == u32::MAX {
+            return;
         }
-        self.0[slot] = range;
+        self.index[slot] = u32::MAX;
+        let idx = idx as usize;
+        self.dense.swap_remove(idx);
+        if let Some((moved_slot, _)) = self.dense.get(idx) {
+            self.index[*moved_slot as usize] = idx as u32;
+        }
+    }
+
+    fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
+        let slot_idx = slot as usize;
+        let Some(range) = range else {
+            self.remove(slot_idx);
+            return;
+        };
+        if slot_idx >= self.index.len() {
+            self.index.resize(slot_idx + 1, u32::MAX);
+        }
+        let idx = self.index[slot_idx];
+        if idx == u32::MAX {
+            self.index[slot_idx] = self.dense.len() as u32;
+            self.dense.push((slot, range));
+        } else {
+            self.dense[idx as usize].1 = range;
+        }
     }
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
     fn forget_part(&mut self, part: u32, parts: u32) {
-        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
+        let mut slot = part as usize;
+        let step = parts as usize;
+        while slot < self.index.len() {
+            self.remove(slot);
+            slot += step;
+        }
     }
 
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
-        self.0.iter().flatten()
+        self.dense.iter().map(|(_, r)| r)
+    }
+
+    #[cfg(test)]
+    fn is_none(&self, slot: u32) -> bool {
+        self.index.get(slot as usize).is_none_or(|&idx| idx == u32::MAX)
     }
 }
 
@@ -704,7 +752,7 @@ mod heap_range_tests {
     #[test]
     fn every_slot_is_looked_at_again_in_a_round() {
         const SLOTS: u32 = 1000;
-        let mut ranges = HeapRanges(Vec::new());
+        let mut ranges = HeapRanges::default();
         ranges.set(7, None);
         assert_eq!(ranges.ranges().count(), 0);
         for slot in (0..SLOTS).step_by(3) {
@@ -715,7 +763,7 @@ mod heap_range_tests {
             let part = (pass % HEAP_ROUND) as u32;
             ranges.forget_part(part, parts);
             for slot in (0..SLOTS).step_by(3).filter(|slot| slot % parts == part) {
-                assert!(ranges.0[slot as usize].is_none(), "slot {slot} not forgotten");
+                assert!(ranges.is_none(slot), "slot {slot} not forgotten");
                 ranges.set(slot, Some(((), pass, pass)));
             }
             assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize);
@@ -734,7 +782,7 @@ mod heap_range_tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         let copies: Vec<Arc<u64>> = (0..4400).map(Arc::new).collect();
-        let (mut table, mut slots) = (HashMap::new(), HeapRanges(Vec::new()));
+        let (mut table, mut slots) = (HashMap::new(), HeapRanges::default());
         for slot in 0..72_000u32 {
             let copy = &copies[slot as usize * 7919 % 4400];
             table.insert(slot, (copy.clone(), u64::from(slot), u64::from(slot) + 64));
@@ -918,11 +966,11 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let (passes, ranges) = kept
         .get_or_insert_with(Default::default)
         .entry(std::ptr::from_ref(host) as usize)
-        .or_insert_with(|| (0, HeapRanges(Vec::new())));
+        .or_insert_with(|| (0, HeapRanges::default()));
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        ranges.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
@@ -975,21 +1023,15 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {
         let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
-        // (After each piece while the device lives: a cheap query.)
-        if alive
-            && let Some(why) = crate::descriptor::host::device_removed()
-            && !GONE.swap(true, Ordering::Relaxed)
-        {
-            let last: Vec<String> = parts[n]
-                .iter()
-                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                .map(|s| s.chars().take(200).collect())
-                .collect();
-            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
-            crate::host::log_removal_context();
-        }
         let _ = found[n].set(looked);
     });
+    if alive
+        && let Some(why) = crate::descriptor::host::device_removed()
+        && !GONE.swap(true, Ordering::Relaxed)
+    {
+        tracing::error!(why, "the host device went while buffer views of the heap were made");
+        crate::host::log_removal_context();
+    }
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
         let range = shows.map(|(range, written)| {
             if written {
@@ -1004,8 +1046,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
+    static LAST_SPANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
+    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+        std::collections::HashMap::with_capacity_and_hasher(LAST_SPANS.load(Ordering::Relaxed), Default::default());
     let mut views = 0u32;
     for (shadow, from, to) in ranges.ranges() {
         views += 1;
@@ -1015,6 +1059,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         span.2 = span.2.max(*to);
     }
     drop(kept);
+    // (Sized by the last pass's: VIctory-NVIDIA PR #448.)
+    LAST_SPANS.store(spans.len(), Ordering::Relaxed);
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -1386,6 +1432,10 @@ impl State {
         }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+            return 0;
+        }
+        // The first part of a dispatch ([`dispatch_parts`]), or no dispatch.
+        if kind == victory_shader::emit::USER_GROUP_BASE {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -3121,8 +3171,28 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        if y > HOST_GROUPS || z > HOST_GROUPS {
+            once!(x, y, z, "a dispatch of more groups in y or z than the host runs");
+        }
+        // The console runs more groups in x than the host does at once: the
+        // host runs such a dispatch in parts, the program's group x starting
+        // at each part's first group (`USER_GROUP_BASE`, 0 as bound). A
+        // program that does not read its group x runs alike in every part.
+        let base = compute_word(p, victory_shader::emit::USER_GROUP_BASE);
+        for (first, count) in dispatch_parts(x) {
+            // SAFETY: an open list with everything set; the parameter and
+            // dword are the pipeline's.
+            unsafe {
+                if let Some((param, word)) = base.filter(|_| first > 0) {
+                    list.list.SetComputeRoot32BitConstant(param, first, word);
+                }
+                list.list.Dispatch(count, y, z);
+            }
+        }
+        if let Some((param, word)) = base.filter(|_| x > HOST_GROUPS) {
+            // SAFETY: as above; the next dispatch starts at group 0.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4528,6 +4598,18 @@ fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
 }
 
+use victory_shader::emit::HOST_GROUPS;
+
+/// The parts a dispatch of `x` groups in x runs in on the host: each part's
+/// first group and its count, at most [`HOST_GROUPS`]; one empty part for
+/// none. (Marvisak/VIctory#3086.)
+fn dispatch_parts(x: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..x.div_ceil(HOST_GROUPS).max(1)).map(move |i| {
+        let first = i * HOST_GROUPS;
+        (first, (x - first).min(HOST_GROUPS))
+    })
+}
+
 /// Where a compute pipeline's user data has a word the host computes: the
 /// root parameter and the dword in it.
 fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
@@ -4659,6 +4741,23 @@ mod signature_tests {
 #[cfg(test)]
 mod thread_tests {
     use super::*;
+
+    /// A dispatch of more groups in x than the host runs at once is run in
+    /// parts of at most 65,535 that together cover each group once.
+    #[test]
+    fn large_dispatches_run_in_parts() {
+        let parts = |x| dispatch_parts(x).collect::<Vec<_>>();
+        assert_eq!(parts(0), [(0, 0)]);
+        assert_eq!(parts(100), [(0, 100)]);
+        assert_eq!(parts(65_535), [(0, 65_535)]);
+        assert_eq!(parts(65_536), [(0, 65_535), (65_535, 1)]);
+        assert_eq!(parts(115_200), [(0, 65_535), (65_535, 49_665)]);
+        let all = parts(u32::MAX);
+        assert!(all.iter().all(|&(_, n)| n <= HOST_GROUPS));
+        assert!(all.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0), "parts follow each other");
+        let last = all.last().unwrap();
+        assert_eq!(last.0 + last.1, u32::MAX);
+    }
 
     #[test]
     fn threads_are_counted_in_the_programs_groups() {

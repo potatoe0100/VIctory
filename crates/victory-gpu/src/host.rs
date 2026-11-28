@@ -216,9 +216,33 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
+/// Whether plain buffers are waited for as well ([`wait_resident`]).
+/// `VICTORY_WAIT_RESIDENT=textures` waits for texture blocks and textures
+/// only: the device losses above lay in texture blocks, and the waits for
+/// buffers are most of them (an RTX 4090 run: 59,000 waits, 18.1 s, the
+/// longest 1.2 s; on an RTX 3080, 212,000 waits, 60.8 s, Belobug issue #346).
+fn wait_resident_buffers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0" && v != "textures"))
+}
+
 /// The flag memory is made with that [`resident`] waits for.
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// [`not_resident`], [`resident`] and [`mapped`] for a plain buffer
+/// ([`wait_resident_buffers`]).
+fn buffer_not_resident() -> D3D12_HEAP_FLAGS {
+    if wait_resident_buffers() { not_resident() } else { D3D12_HEAP_FLAG_NONE }
+}
+
+fn buffer_resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if wait_resident_buffers() { resident(device, object) } else { Ok(()) }
+}
+
+fn buffer_mapped(device: &ID3D12Device) -> windows::core::Result<()> {
+    if wait_resident_buffers() { mapped(device) } else { Ok(()) }
 }
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
@@ -2337,6 +2361,11 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Per-shadow coalesced span `(copies_index, from, to)` in the current
+    /// uninterrupted segment (cleared on title writes and per-shadow on GPU
+    /// writes): lets `VICTORY_THIN` workers merge overlapping/adjacent
+    /// refreshes before the submitting thread ever walks `copies`.
+    refreshed_span: std::collections::HashMap<usize, (usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
@@ -2384,6 +2413,7 @@ impl Deferred {
     /// date before them is not any more.
     fn title_written(&mut self) {
         self.refreshed.clear();
+        self.refreshed_span.clear();
         self.gpu_written.clear();
         self.filled.clear();
     }
@@ -2946,8 +2976,9 @@ const WHY_FENCE: usize = 10;
 /// microseconds settles waited for the card; value waits met by a flight's
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
-/// copy, a fill of upload memory, a texture).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+/// copy, a fill of upload memory, a texture); page remaps that waited for
+/// flights which may write the pages ([`land_before_remap`]).
+static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -3443,6 +3474,51 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// Whether flights that may write pages land before the pages are remapped
+/// ([`land_before_remap`]; `VICTORY_LAND_BEFORE_REMAP=1`). Off by default on
+/// the nvidia-4060 branch (on in the fork it comes from, and not run in the
+/// game there): without it the remap is made at once and such a flight lands
+/// behind it, as before.
+fn lands_before_remap() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_BEFORE_REMAP").is_some_and(|v| v == "1"))
+}
+
+/// Title memory `[address, address + len)` is about to show other physical
+/// pages: a queue's page-mapping copy, which the console runs behind the
+/// work sent before it. Flights in the air ([`late`]) whose shaders may
+/// write that memory land first, so that what they wrote goes to the pages
+/// it was written to; landed after the remap, it went to the pages mapped
+/// in their place (another resource's, which the title shows at other
+/// addresses too). `VICTORY_LAND_BEFORE_REMAP=1` turns it on
+/// ([`lands_before_remap`]).
+///
+/// Ported from Steenax6/VIctory-NVID 20315a5. From a thread of the title's
+/// that holds none of our locks, as [`settle_for_fence`] is called; never
+/// from the thread that lands flights, which it waits for.
+pub(crate) fn land_before_remap(address: u64, len: u64) {
+    if !late() || len == 0 || !lands_before_remap() {
+        return;
+    }
+    let (from, to) = (address as usize, address.saturating_add(len) as usize);
+    let pending = {
+        let line = line();
+        line.settling || touches(&line.written, from, to)
+    };
+    if !pending {
+        return;
+    }
+    LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+    if relay() {
+        // Only until the flights that may write there have landed (the
+        // thread that lands them works `written` out anew from those still
+        // in the air).
+        relay_wait(WHY_SYNC, |line| !line.settling && !touches(&line.written, from, to));
+    } else {
+        settle_now(WHY_SYNC);
+    }
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
@@ -3901,7 +3977,7 @@ fn late_line(frames: f64) {
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
-         settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
+         settled for: a synchronous submission or present {:.1} (pages remapped under flights' writes {:.1}), the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
          a texture {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
@@ -3911,6 +3987,7 @@ fn late_line(frames: f64) {
         if s[1] > 0.0 { s[11] / s[1] } else { 0.0 },
         s[12] / 1000.0,
         s[WHY_SYNC],
+        s[18],
         s[WHY_CARD_DONE],
         s[WHY_VALUE],
         s[WHY_STALE],
@@ -6845,6 +6922,7 @@ impl HostList {
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+        deferred.refreshed_span.clear();
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -7125,10 +7203,21 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        // A target whose ticket went stale (the title reused or remapped the
+        // memory it tiles into) must be re-registered, or the read-back
+        // would be dropped as one of memory the texture no longer holds.
+        let existing = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|target| target.owner() == resource as usize);
+        match existing {
+            Some(entry) if !entry.fresh() => {
+                if let Some(target) = crate::texback::Target::new(resource) {
+                    *entry = target;
+                }
+            }
+            None => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
+            Some(_) => {}
         }
     }
 
@@ -7154,6 +7243,24 @@ impl HostList {
             u.behind[0] = Some(true);
             self.changed_something();
         }
+    }
+
+    /// For tests: whether the list's read-back wants a *fresh* target for
+    /// `resource` — one whose ticket has not gone stale. A stale target is
+    /// one the title's memory reuse invalidated, which the list must
+    /// re-register on the next write of `resource`.
+    #[cfg(test)]
+    pub(crate) fn back_wanted_fresh(&self, resource: crate::object::This) -> bool {
+        self.deferred()
+            .back_wanted
+            .iter()
+            .any(|t| t.owner() == resource as usize && t.fresh())
+    }
+
+    /// For tests: how many texture read-backs the list recorded at its close.
+    #[cfg(test)]
+    pub(crate) fn texture_back_count(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -7429,11 +7536,33 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let deferred = &mut *deferred;
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address.saturating_add(len);
+        if let Some(&mut (idx, ref mut from, ref mut to)) = deferred.refreshed_span.get_mut(&ptr)
+            && address <= *to
+            && end >= *from
+        {
+            if *from <= address && end <= *to {
+                return;
+            }
+            let new_from = (*from).min(address);
+            let new_to = (*to).max(end);
+            if let Some(Step::Refresh(_, a, l)) = deferred.copies.get_mut(idx) {
+                *a = new_from;
+                *l = new_to - new_from;
+                *from = new_from;
+                *to = new_to;
+                return;
+            }
+        }
+        let key = (ptr, address, len);
         if deferred.refreshed.insert(key) {
+            let idx = deferred.copies.len();
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+            deferred.refreshed_span.insert(ptr, (idx, address, end));
         }
     }
 
@@ -7449,7 +7578,9 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        deferred.refreshed_span.remove(&ptr);
+        let key = (ptr, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
         }
@@ -8532,31 +8663,61 @@ impl Batch {
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let journal = crate::watch::read_journal();
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new_with(&journal, *from, *to - *from));
+            drop(journal);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        // (The textures one to a thread; the copies as `VICTORY_WIDE_CHUNK` says.)
-        crate::shadow::wide_each_from(spans.len() + due.len(), due.len(), crate::shadow::wide_chunk(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+        let due_len = due.len();
+        let spans_len = spans.len();
+        // Textures first (longer pieces, 1 per worker claim), then buffer
+        // refreshes in 32-item chunks sharing one `JournalRead` and one
+        // `FLUSHES[2]` increment per chunk (never holding `JournalRead` across
+        // `Self::update`).
+        if due_len > 0 {
+            crate::shadow::wide_each(due_len, move |i| due[i].refresh());
+        }
+        crate::shadow::wide_chunks(spans_len, 32, move |range| {
+            if !many {
+                for i in range {
+                    let (shadow, from, to) = &spans[i];
+                    Self::update(shadow, *from, *to);
+                }
                 return;
             }
-            Self::update(shadow, *from, *to);
+            let mut need = [0usize; 32];
+            let mut n_need = 0usize;
+            let mut skipped = 0u64;
+            {
+                let journal = crate::watch::read_journal();
+                for i in range {
+                    let (shadow, from, to) = &spans[i];
+                    if shadow.nothing_new_with(&journal, *from, *to - *from) {
+                        skipped += 1;
+                    } else {
+                        need[n_need] = i;
+                        n_need += 1;
+                    }
+                }
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = skipped;
+            #[cfg(feature = "diagnostics")]
+            if skipped > 0 {
+                FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+            }
+            for &i in &need[..n_need] {
+                let (shadow, from, to) = &spans[i];
+                Self::update(shadow, *from, *to);
+            }
         });
         if ahead {
             crate::watch::ask_ahead_done();
@@ -8605,9 +8766,21 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
+        crate::shadow::wide_chunks(due.len(), 32, move |range| {
+            let mut need = [0usize; 32];
+            let mut n_need = 0usize;
+            {
+                let journal = crate::watch::read_journal();
+                for i in range {
+                    let (shadow, from, to) = &due[i];
+                    if !shadow.nothing_new_with(&journal, *from, *to - *from) {
+                        need[n_need] = i;
+                        n_need += 1;
+                    }
+                }
+            }
+            for &i in &need[..n_need] {
+                let (shadow, from, to) = &due[i];
                 Self::update(shadow, *from, *to);
             }
         });
@@ -8694,14 +8867,16 @@ impl Batch {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let journal = crate::watch::read_journal();
+            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_with(&journal, *from, *to - *from));
+            drop(journal);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -8722,16 +8897,44 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
+                // Chunked claiming: one `JournalRead` and one `FLUSHES[2]`
+                // increment per 32-item chunk instead of per item.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each_from(refreshes.len(), 0, crate::shadow::wide_chunk(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                let len = refreshes.len();
+                let check = len > FEW;
+                crate::shadow::wide_chunks(len, 32, move |range| {
+                    if !check {
+                        for i in range {
+                            let (shadow, from, to) = &refreshes[i];
+                            Self::update(shadow, *from, *to);
+                        }
                         return;
                     }
-                    Self::update(shadow, *from, *to);
+                    let mut need = [0usize; 32];
+                    let mut n_need = 0usize;
+                    let mut skipped = 0u64;
+                    {
+                        let journal = crate::watch::read_journal();
+                        for i in range {
+                            let (shadow, from, to) = &refreshes[i];
+                            if shadow.nothing_new_with(&journal, *from, *to - *from) {
+                                skipped += 1;
+                            } else {
+                                need[n_need] = i;
+                                n_need += 1;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
+                    let _ = skipped;
+                    #[cfg(feature = "diagnostics")]
+                    if skipped > 0 {
+                        FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+                    }
+                    for &i in &need[..n_need] {
+                        let (shadow, from, to) = &refreshes[i];
+                        Self::update(shadow, *from, *to);
+                    }
                 });
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
@@ -9119,7 +9322,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9127,7 +9330,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    buffer_resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9748,8 +9951,36 @@ impl Host {
     }
 }
 
+/// The property our hook of the title's window procedure puts on the
+/// windows the title makes (`TITLE_PROC` in `victory_hle::modules::lifecycle`).
+const TITLE_HOOK: PCWSTR = w!("victory.wndproc");
+
+/// A visible top-level window of this process, as [`title_window`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Candidate {
+    hwnd: usize,
+    /// Carries [`TITLE_HOOK`]: a window the title made.
+    hooked: bool,
+    /// Its client area is not empty.
+    sized: bool,
+}
+
+/// Which of `candidates` (in z-order, topmost first) is the title's: the
+/// one our hook marked, else the first with a client area. Pure, for testing.
+fn pick_title_window(candidates: &[Candidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .find(|c| c.hooked)
+        .or_else(|| candidates.iter().find(|c| c.sized))
+        .map(|c| c.hwnd)
+}
+
 /// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// it made one. Not simply the first visible one: started under a
+/// pseudoconsole (from Windows Terminal, or by a process that has one), this
+/// process also owns a visible `PseudoConsoleWindow` of 0x0 pixels. When
+/// that one was above the title's window in z-order, the swap chain was made
+/// for it, and the title's window stayed white with no frame ever shown.
 fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
@@ -9759,16 +9990,59 @@ fn title_window() -> Option<HWND> {
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
             {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+                let mut area = RECT::default();
+                let sized = GetClientRect(hwnd, &mut area).is_ok() && area.right > area.left && area.bottom > area.top;
+                let hooked = !GetPropW(hwnd, TITLE_HOOK).0.is_null();
+                (*(found.0 as *mut Vec<Candidate>)).push(Candidate { hwnd: hwnd.0 as usize, hooked, sized });
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
-    // SAFETY: the callback only writes `found`, which outlives the call.
+    let mut found: Vec<Candidate> = Vec::new();
+    // SAFETY: the callback only adds to `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
+    let picked = pick_title_window(&found);
+    if !found.iter().any(|c| c.hooked) {
+        tracing::info!(
+            windows = found.len(),
+            "no window of the title's among ours: presenting to the first with a client area, if any"
+        );
+    }
+    picked.map(|hwnd| HWND(hwnd as *mut _))
+}
+
+#[cfg(test)]
+mod title_window_tests {
+    use super::{Candidate, pick_title_window};
+
+    fn window(hwnd: usize, hooked: bool, sized: bool) -> Candidate {
+        Candidate { hwnd, hooked, sized }
+    }
+
+    /// A pseudoconsole's 0x0 window above the title's in z-order.
+    #[test]
+    fn the_titles_window_wins_over_a_pseudo_console_above_it() {
+        let found = [window(1, false, false), window(2, true, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn the_titles_window_counts_even_while_its_client_area_is_empty() {
+        let found = [window(1, false, true), window(2, true, false)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn without_one_of_the_titles_the_first_with_a_client_area() {
+        let found = [window(1, false, false), window(2, false, true), window(3, false, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn a_pseudo_console_alone_is_no_window_to_present_to() {
+        assert_eq!(pick_title_window(&[window(1, false, false)]), None);
+        assert_eq!(pick_title_window(&[]), None);
+    }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
@@ -9954,7 +10228,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -9962,8 +10236,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    buffer_resident(&self.device, b)?;
+                    buffer_mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10043,7 +10317,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    buffer_not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -10051,8 +10325,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    buffer_resident(&self.device, b)?;
+                    buffer_mapped(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -10094,7 +10368,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                buffer_not_resident(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -10105,7 +10379,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| buffer_resident(&self.device, b))).and_then(|()| buffer_mapped(&self.device));
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -10455,12 +10729,22 @@ mod refresh_tests {
         }
     }
 
+    /// One submission's asking at a time in this test process, as in the
+    /// layer (one thread prepares them): taken by [`submission`] and by the
+    /// tests that ask as a submission does themselves. (Without it, one
+    /// test's asking ended another's while a third thread of that one was
+    /// refreshing: 4 of 40 runs of these tests with `watch::`'s left a copy
+    /// behind, with every hold of pages, 1 of 40 holding all memory; none
+    /// in 60 of the test alone.)
+    fn one_submission() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Prepares as a submission does: one asking for all the ranges, the
     /// refreshes in several flushes, the asking's end.
     fn submission(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize) {
-        // One at a time, as submissions are.
-        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = one_submission();
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
         crate::watch::ask_once(&asked);
         let mut batch = Batch::default();
@@ -10535,6 +10819,100 @@ mod refresh_tests {
                 assert!(same, "round {round}: {at:#x}+{n:#x} of a copy at {start:#x}; first byte {}", byte(*at));
             }
         }
+    }
+
+    /// A submission's asking beside other threads' askings, as the heaps'
+    /// thread and the helpers' texture refreshes ask while one is prepared:
+    /// copies of the same title memory refreshed by a submission on one
+    /// thread and one range at a time on another, while a third asks about
+    /// other memory without end. Whatever was written before a round, every
+    /// copy holds what title memory holds after it (an asking that forgot
+    /// pages another had not yet noted would leave one of them behind).
+    #[test]
+    fn askings_of_other_threads_beside_a_submission() {
+        const LEN: usize = 32 * PAGE;
+        let mut random = Random(0x2468_1357_ACE0_BDF9);
+        let regions = [title(LEN, false), title(LEN, true)];
+        let elsewhere = title(LEN, false);
+        // SAFETY: the test's own memory.
+        unsafe {
+            for r in regions.into_iter().chain([elsewhere]) {
+                std::ptr::write_bytes(r as *mut u8, 1, LEN);
+            }
+        }
+        // The submission's copies, and the other thread's over the same
+        // memory, cut elsewhere.
+        let cut = |spans: &[(usize, usize)]| -> Vec<(Arc<Shadow>, *mut u8, usize, usize)> {
+            regions
+                .iter()
+                .flat_map(|&region| {
+                    spans.iter().map(move |&(from, to)| {
+                        let data = memory(to - from);
+                        (Shadow::unbacked((region + from) as u64, data, (to - from) as u64, false), data, region + from, to - from)
+                    })
+                })
+                .collect()
+        };
+        let ours = cut(&(0..8).map(|i| (i * 4 * PAGE, (i + 1) * 4 * PAGE)).collect::<Vec<_>>());
+        let theirs = cut(&[(100, 6 * PAGE + 9), (6 * PAGE + 9, 19 * PAGE), (19 * PAGE, LEN - 3), (3 * PAGE, 4 * PAGE + 1)]);
+        let ranges: Vec<(Arc<Shadow>, usize, usize)> = ours.iter().map(|c| (c.0.clone(), c.2, c.3)).collect();
+        let same = |c: &(Arc<Shadow>, *mut u8, usize, usize)| unsafe {
+            std::slice::from_raw_parts(c.2 as *const u8, c.3) == std::slice::from_raw_parts(c.1, c.3)
+        };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        // Told to stop however the rounds end (a failed one too: the scope
+        // would wait for it without end).
+        struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        const ROUNDS: usize = 300;
+        // (Raw pointers are the test's own memory, used by one thread at a time.)
+        struct Sent<T>(T);
+        unsafe impl<T> Send for Sent<T> {}
+        unsafe impl<T> Sync for Sent<T> {}
+        let theirs = Sent(theirs);
+        std::thread::scope(|s| {
+            // Without end, about memory no copy here holds.
+            s.spawn(|| {
+                let mut n = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let at = elsewhere + (n * 7 % 31) * PAGE;
+                    // SAFETY: the test's own memory.
+                    unsafe { (at as *mut u8).write_volatile(n as u8) };
+                    let _ = crate::watch::writes(at, at + PAGE, false);
+                    n += 1;
+                }
+            });
+            let _stop = Stop(&stop);
+            for round in 0..ROUNDS {
+                for _ in 0..1 + random.below(8) {
+                    let at = regions[random.below(2)] + random.below(LEN - 64);
+                    for i in 0..1 + random.below(60) {
+                        // SAFETY: the test's own memory.
+                        unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                    }
+                }
+                // One range at a time on another thread, beside the submission.
+                std::thread::scope(|s| {
+                    let theirs = &theirs;
+                    s.spawn(move || {
+                        for c in &theirs.0 {
+                            c.0.update(c.2, c.3);
+                        }
+                    });
+                    submission(&ranges, 1 + random.below(3));
+                });
+                for c in &ours {
+                    assert!(same(c), "round {round}: a copy the submission refreshed at {:#x}+{:#x} differs", c.2, c.3);
+                }
+                for c in &theirs.0 {
+                    assert!(same(c), "round {round}: a copy refreshed beside it at {:#x}+{:#x} differs", c.2, c.3);
+                }
+            }
+        });
     }
 
     /// A copy in the card's memory, with the card's side and the sends to it
@@ -10837,6 +11215,7 @@ mod refresh_tests {
             // Ends in the middle of pages.
             let (at, len) = (region + 500, 5 * PAGE);
             let look = |expected: bool, what: &str| {
+                let _one = one_submission();
                 // The submission's one asking, which takes two ranges. (Again
                 // if a submission of another test ended it.)
                 let mut known = false;
