@@ -6212,6 +6212,15 @@ impl Host {
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
+        // (skornuta) Bindless usage feedback (`crate::feedback`): its copy and clear, first.
+        if crate::feedback::on()
+            && let Some(pre) = crate::feedback::pre_list()
+        {
+            lists.insert(0, Some(pre));
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
+        }
         crate::watch::ask_once_end();
         split.part(2);
         stage.next("submit: snapshots");
@@ -6301,6 +6310,9 @@ impl Host {
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
+            if crate::feedback::on() {
+                crate::feedback::sent(*submitted);
+            }
             self.card_sent();
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
@@ -6393,6 +6405,10 @@ impl Host {
                 }
             }
             let _ = (i, started);
+        }
+        // (skornuta) The last group's value: every group of this submission is behind it.
+        if crate::feedback::on() {
+            crate::feedback::sent(*submitted);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -10817,6 +10833,13 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// (skornuta) The value of the host's own fence the card has reached: every submission
+    /// signalled up to it has run (`crate::feedback`).
+    pub(crate) fn completed(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

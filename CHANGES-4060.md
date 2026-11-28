@@ -3,10 +3,12 @@
 Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small set of changes for an 8 GB card
 (RTX 4060) on an Intel PC. Not yet measured in game; each change below is kept only if it measurably helps.
 
-## 8 GB card (on by default; each has a switch)
+## 8 GB card (each has a switch)
 
-- Small-card lines (`VICTORY_SMALL_CARD_LINES=0` backs out): on budgets of 9 GiB or less the texture line is 94 %,
-  render-target room at most a quarter of the budget, room for card buffer copies at most a sixteenth.
+- Small-card lines, off until measured (`VICTORY_SMALL_CARD_LINES=1`): on budgets of 9 GiB or less the texture line
+  94 %, render-target room at most a quarter of the budget, room for card buffer copies at most a sixteenth.
+- Bindless feedback (skornuta, `VICTORY_BINDLESS_FEEDBACK=1` set by play.rs): NV's slot eviction may drop textures
+  picked by index that no shader has read for 60 s.
 - Texture room only while the card is under its budget (edupode a0ead598): free parts of mostly empty blocks no
   longer count as room once the card is past it.
 - List upload buffers pooled (edupode 62bba05, `VICTORY_UPLOAD_POOL=0` backs out).

@@ -113,6 +113,11 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_SLOT_EVICT", "1"),
     ("VICTORY_ALLOCATOR_TRIM", "1"),
     ("VICTORY_BUDGET_PACK", "1"),
+    // Bindless usage feedback (skornuta, patches 09-12): shaders mark the heap textures they
+    // read, so slot eviction can let go of indexed textures no shader read for 60 s (the
+    // "indexed textures had no room" waits of 8 GB cards). Its pipelines are a library of their
+    // own; the shader cache warms again once. VICTORY_BINDLESS_FEEDBACK=0 leaves it out.
+    ("VICTORY_BINDLESS_FEEDBACK", "1"),
 ];
 
 /// Path settings a start keeps from its surroundings; every other

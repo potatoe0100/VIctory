@@ -1312,6 +1312,9 @@ struct Hosted {
     /// made after that came back: not taken so again for [`PROTECT_MS`].
     slot_evicted: std::sync::atomic::AtomicU64,
     slot_returned: std::sync::atomic::AtomicU64,
+    /// (skornuta) The frame (plus one) the eviction let it go while no shader read any of its
+    /// slots (`crate::feedback`); 0: not, or made again since.
+    fb_evicted: std::sync::atomic::AtomicU64,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1815,6 +1818,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
+        r.host.fb_evicted.store(0, Relaxed);
         // Let go by `slot_evict` (`VICTORY_SLOT_EVICT=1`) and back: counted,
         // and not taken so again for a while (memory stack by skornuta,
         // skornuta/victory-memory-stack 57fb136, GPL-3.0).
@@ -1825,6 +1829,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             SLOT_EVICT[4].fetch_add(u64::from(!crate::host::long_ago(evicted, FAST_BACK_MS, 0)), Relaxed);
             SLOT_EVICT[5].fetch_add(now.wrapping_sub(evicted) & 0xffff_ffff, Relaxed);
             r.host.slot_returned.store(now.max(1), Relaxed);
+            note_remake();
         }
     }
     let now = crate::host::moment();
@@ -1832,6 +1837,62 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         r.host.used.store(now, Relaxed);
     }
     made.clone()
+}
+
+/// (skornuta) If title texture `this` was let go by the slot eviction while no shader read any of
+/// its slots (`crate::feedback`) and has not been made since: the frame it went.
+#[cfg(windows)]
+pub(crate) fn unread_evicted(this: This) -> Option<u64> {
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    match r.host.fb_evicted.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        f => Some(f - 1),
+    }
+}
+
+/// (skornuta) Copies the slot eviction let go that were made again, by the call path that made
+/// them: the return addresses above `hosted`, as offsets in this executable (0: another
+/// module), with how many. For finding what brings evicted textures back (the memory minute
+/// lists the most common).
+static REMADE: std::sync::Mutex<Option<std::collections::HashMap<[u32; 8], u64>>> = std::sync::Mutex::new(None);
+
+/// Notes the call path of a copy made again after the eviction let it go ([`REMADE`]).
+#[cfg(windows)]
+fn note_remake() {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    let mut frames = [std::ptr::null_mut::<core::ffi::c_void>(); 10];
+    // SAFETY: room for 10 return addresses; this thread's own stack.
+    let n = unsafe { RtlCaptureStackBackTrace(2, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    // SAFETY: the executable's own module handle, never freed.
+    let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+    let mut key = [0u32; 8];
+    for (k, &f) in key.iter_mut().zip(&frames[..n.min(8)]) {
+        let at = f as usize;
+        *k = if at >= base && at - base < 1 << 30 { (at - base) as u32 } else { 0 };
+    }
+    let mut map = REMADE.lock().unwrap_or_else(|e| e.into_inner());
+    *map.get_or_insert_with(Default::default).entry(key).or_insert(0) += 1;
+}
+
+/// For the memory minute: the `most` call paths that made evicted copies again most often, as
+/// "count: victory.exe+rva <- ..." each.
+#[cfg(windows)]
+pub(crate) fn remakes(most: usize) -> Vec<String> {
+    let map = REMADE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = map.as_ref() else { return Vec::new() };
+    let mut all: Vec<(&[u32; 8], &u64)> = map.iter().collect();
+    all.sort_unstable_by(|a, b| b.1.cmp(a.1));
+    all.into_iter()
+        .take(most)
+        .map(|(key, n)| {
+            let path: Vec<String> = key.iter().map(|&rva| if rva == 0 { "-".into() } else { format!("{rva:#x}") }).collect();
+            format!("{n}: {}", path.join(" <- "))
+        })
+        .collect()
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -1988,9 +2049,8 @@ pub(crate) const SMALL_CARD: u64 = 9 << 30;
 /// sweep's (`crate::host::vram_keep_below`), at most a quarter of the
 /// budget kept for render targets ([`targets_most`]) and at most a
 /// sixteenth of it for card copies not made yet
-/// (`crate::shadow::card_room_kept`). On with the room guard ([`room`]:
-/// the card under its budget, after edupode a0ead598);
-/// `VICTORY_SMALL_CARD_LINES=0`: the lines of every card, as before.
+/// (`crate::shadow::card_room_kept`). Off on this branch until measured
+/// (`VICTORY_SMALL_CARD_LINES=1` turns it on).
 ///
 /// Why (RTX 4060, 2026-11-28, 6,248 MB budget): textures picked by index
 /// waited for room at 5,529 MB in use; at 90 % with both reserves counted
@@ -2000,7 +2060,7 @@ pub(crate) fn small_card_lines(budget: u64) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     budget > 0
         && budget <= SMALL_CARD
-        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_none_or(|v| v != "0"))
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_some_and(|v| v == "1"))
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -2640,8 +2700,17 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
         while ring.len() > 120 {
             ring.pop_front();
         }
-        frame_at(&ring, now_ms.saturating_sub(idle_ms))
+        (
+            frame_at(&ring, now_ms.saturating_sub(idle_ms)),
+            // (skornuta) Bindless usage feedback: the frame its own, longer idle time back, if
+            // the feedback has watched every frame since (`crate::feedback::covers`).
+            crate::feedback::on()
+                .then(|| frame_at(&ring, now_ms.saturating_sub(crate::feedback::idle_ms())))
+                .flatten()
+                .filter(|&c| crate::feedback::covers(c)),
+        )
     };
+    let (cutoff, fb_cutoff) = cutoff;
     static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let (on, need) = slot_plan(EVICTING.load(Relaxed), budget, used, high, low, cap);
     EVICTING.store(on, Relaxed);
@@ -2658,6 +2727,7 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
     let all = textures();
     let mut copies = Vec::new();
     let mut raws = std::collections::HashMap::new();
+    let mut fb_old = std::collections::HashSet::new();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
         let r = unsafe { &*(at as *const Resource) };
@@ -2677,13 +2747,22 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
             && std::sync::Arc::strong_count(host) == 1
         {
             copies.push((at, stamp & 0xffff_ffff, host.bytes));
-            raws.insert(windows::core::Interface::as_raw(&host.texture) as usize, at);
+            let raw = windows::core::Interface::as_raw(&host.texture) as usize;
+            raws.insert(raw, at);
+            // (skornuta) Bindless: only a copy made (or last asked for) the feedback's whole
+            // idle time ago. One made since may not have been drawn yet (the world's
+            // textures stream in ahead of the frames that show them): never read is not
+            // idle. A first run let go of such copies as they arrived, and 457 came back
+            // within 2 s.
+            if fb_cutoff.is_some() && crate::host::long_ago(stamp, crate::feedback::idle_ms(), frames) {
+                fb_old.insert(raw);
+            }
         }
     }
     if copies.is_empty() {
         return;
     }
-    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff);
+    let (slots, kept, blocked) = crate::descriptor::evictable_slots(&raws, frame, cutoff, fb_cutoff, &fb_old);
     SLOT_STATE[3].store(raws.len() as u64, Relaxed);
     SLOT_STATE[2].store(blocked, Relaxed);
     SLOT_STATE[1].store(kept, Relaxed);
@@ -2705,6 +2784,11 @@ fn slot_evict(video: Option<[u64; 4]>, idle_ms: u64, frames: u64) {
                 r.host.wanted.store(u32::MAX, Relaxed);
                 r.host.used.store(0, Relaxed);
                 r.host.slot_evicted.store(crate::host::moment().max(1), Relaxed);
+                // (skornuta) Let go while no shader read it: its other slots, when the queue
+                // comes to them, are parked too (`unread_evicted`).
+                if slots[&at].iter().any(|s| s.2) {
+                    r.host.fb_evicted.store(frame + 1, Relaxed);
+                }
                 made.take()
             } else {
                 None
@@ -3301,6 +3385,7 @@ fn hand_out_resource(
             grown: std::sync::atomic::AtomicBool::new(false),
             slot_evicted: std::sync::atomic::AtomicU64::new(0),
             slot_returned: std::sync::atomic::AtomicU64::new(0),
+            fb_evicted: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

@@ -1574,9 +1574,11 @@ pub(crate) fn evictable_slots(
     raws: &std::collections::HashMap<usize, usize>,
     frame: u64,
     cutoff: u64,
-) -> (std::collections::HashMap<usize, Vec<(usize, u32)>>, u64, u64) {
+    fb_cutoff: Option<u64>,
+    fb_old: &std::collections::HashSet<usize>,
+) -> (std::collections::HashMap<usize, Vec<(usize, u32, bool)>>, u64, u64) {
     let set: std::collections::HashSet<usize> = raws.keys().copied().collect();
-    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32)>> = std::collections::HashMap::new();
+    let mut by_texture: std::collections::HashMap<usize, Vec<(usize, u32, bool)>> = std::collections::HashMap::new();
     let mut blocked = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
     {
@@ -1587,12 +1589,15 @@ pub(crate) fn evictable_slots(
             let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() else {
                 continue;
             };
-            for (index, raw, ok, lately) in host.slots_showing(&set, frame, cutoff) {
+            for (index, raw, ok, lately, bindless) in host.slots_showing(&set, frame, cutoff, fb_cutoff) {
+                // (skornuta) The feedback's way only for copies that lived its whole idle time.
+                let fresh = bindless && !fb_old.contains(&raw);
+                let (ok, bindless) = (ok && !fresh, bindless && !fresh);
                 if lately {
                     seen.insert(raw);
                 }
                 if ok {
-                    by_texture.entry(raw).or_default().push((at, index));
+                    by_texture.entry(raw).or_default().push((at, index, bindless));
                 } else {
                     blocked.insert(raw);
                 }
@@ -1613,9 +1618,9 @@ pub(crate) fn evictable_slots(
 /// ([`make_waiting`]) or after the draw that reads them through a table.
 /// Returns how many were made. Called before the host copy is let go.
 #[cfg(windows)]
-pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
+pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32, bool)]) -> u64 {
     let mut n = 0;
-    for &(at, index) in slots {
+    for &(at, index, bindless) in slots {
         // (The heap stays while the lock is held: `mirror`.)
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         if !heaps.iter().any(|&(_, _, h)| h == at) {
@@ -1626,8 +1631,17 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
         let (Some(handle), Some(Some(host))) = (heap.handle(index), heap.host.get()) else {
             continue;
         };
-        if host.texture_slot_evicted(index) {
-            drop(heaps);
+        // (skornuta) The view it shows, for the parking below: gone with the slot.
+        let key = if bindless { host.made_key(index) } else { 0 };
+        let evicted = host.texture_slot_evicted(index);
+        // (skornuta) A slot shaders pick by index (`crate::feedback`): parked with that view, so
+        // the queue does not make it again until a shader reads it. (While the heap's lock is
+        // held.)
+        if bindless && key != 0 {
+            host.park(index, key);
+        }
+        drop(heaps);
+        if evicted {
             let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
             let handles = waiting.entry(resource).or_default();
             if !handles.contains(&handle) {
@@ -1639,6 +1653,34 @@ pub(crate) fn evict_slots(resource: usize, slots: &[(usize, u32)]) -> u64 {
     n
 }
 
+/// (skornuta) Of `seen` (view heap slots a shader read, `crate::feedback`), the parked ones of
+/// every shader-visible view heap are due again. Returns how many.
+#[cfg(windows)]
+pub(crate) fn unpark_seen(seen: &[u32]) -> u64 {
+    let frame = crate::frame::current();
+    // (The heaps stay while the lock is held: `mirror`.)
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut n = 0;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: a registered heap, live while the lock is held.
+        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+            n += host.unpark_seen(seen, frame);
+        }
+    }
+    n
+}
+
+/// (skornuta) Slots parked now, over every shader-visible view heap.
+#[cfg(windows)]
+pub(crate) fn parked() -> u64 {
+    // (The heaps stay while the lock is held: `mirror`.)
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        // SAFETY: a registered heap, live while the lock is held.
+        .filter_map(|&(_, _, at)| unsafe { &*(at as *const Heap) }.host.get().and_then(Option::as_ref).map(|h| h.parked()))
+        .sum()
+}
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
