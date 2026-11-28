@@ -34,7 +34,7 @@ $settings = @{
     VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
     VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'faults'; VICTORY_SKIP_PIPELINES = 'none'
     VICTORY_THIN = '1'; VICTORY_JOIN_PARTS = '8'; VICTORY_UPLOAD_AHEAD = '1'
     # Cheap picture fixes, on in both sets:
     # - Overbright views: without rays the light probes keep the sky's light indoors. The fog is bounded by 1.5 times
@@ -61,7 +61,7 @@ $settings = @{
     # Memory stack (skornuta, via VIctory-NVIDIA): idle textures shown by table slots are let go above 85 % of the
     # card's budget, and with the bindless feedback the indexed ones no shader read for 60 s too (resource.rs
     # slot_evict, feedback.rs). The feedback changes every texture-sampling shader: the cache warms again once.
-    VICTORY_SLOT_EVICT = '1'; VICTORY_BINDLESS_FEEDBACK = '1'
+    VICTORY_SLOT_EVICT = '1'; VICTORY_BINDLESS_FEEDBACK = '1'; VICTORY_SPARE_SCALE = '1'
 }
 # Ray tracing mostly off. The structure builder cannot run on NVIDIA (its 64-lane programs are refused; upstream
 # Marvisak/VIctory pull request 2311), so every ray misses, and the passes that turn misses into light made rooms go

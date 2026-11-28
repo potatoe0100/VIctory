@@ -226,6 +226,11 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Per slot: whether `placed` may hold a span for it (set under its lock
+    /// when one is noted; only `note_buffer` notes them, under the slot's own
+    /// lock). A slot without one is forgotten without taking `placed`'s lock,
+    /// which six threads mirroring records waited on (run 122's profile).
+    placed_maybe: Vec<std::sync::atomic::AtomicBool>,
     /// [`NEXT_ID`]'s number for this heap ([`HostHeap::release`]).
     id: u64,
 }
@@ -1898,6 +1903,7 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            placed_maybe: (0..if sampler { 0 } else { count }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -3039,7 +3045,11 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let maybe = self.placed_maybe.get(index as usize);
+        let stale = if placed_view.is_none() && maybe.is_some_and(|m| !m.load(std::sync::atomic::Ordering::Acquire)) {
+            // Nothing noted for the slot: nothing to forget.
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
@@ -3052,12 +3062,18 @@ impl HostHeap {
                     placed.rule = stale_rule();
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
+                    if let Some(m) = maybe {
+                        m.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     // (Under the lock of `placed`: a later write of one of
                     // them comes by here before it makes the slot.)
                     stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()
                 }
                 None => {
                     placed.forget(index);
+                    if let Some(m) = maybe {
+                        m.store(false, std::sync::atomic::Ordering::Release);
+                    }
                     Vec::new()
                 }
             }
