@@ -1,35 +1,33 @@
-# EXPERIMENTAL, AI-assisted, untested against the game. Starts the title on an 8 GB NVIDIA card (RTX 4060 class).
-#   scripts\play-4060.ps1 -Exe <path of your own copy's executable> [-Resolution 480|540|720] [-Quality] [-NoSmoothMotion]
+# EXPERIMENTAL, AI-assisted. VIctory-NVIDIA's play-foxhound.ps1 with settings for an 8 GB card (RTX 4060 class) on a
+# 6-core-or-more Intel PC: the Series S profile, the title's own upscaling, and switches 8 GB users measured as faster.
 #
-# This is scripts\play-nvidia.ps1 (Series S, 540p, ray tracing mostly off) with settings that fit 8 GB:
-# - VICTORY_CARD_BUFFERS_MB 768 instead of 1536. The 1536 MB figure was measured on a 12 GB RTX 5070; on an 8 GB
-#   card the system's video memory budget is about 7.5 GB, and past it Windows moves the card's memory into the PC's
-#   (much slower, and what ended the fork's runs 20 and 24).
-# - On PCs with under 24 GB of RAM, play-nvidia.ps1 puts up to 3072 MB of title memory windows in the card's memory
-#   (VICTORY_WINDOWS_BAR_MB). That is sized for 12 GB+ cards: on 8 GB, 3072 + 3072 kept for render targets + 768 of
-#   buffer copies is past the textures' line (about 6.5 GB). Here it is 1536 instead (-WindowsBarMB N to change).
-#   PCs with 24 GB or more keep it off, as in play-nvidia.ps1.
-# - Everything else (texture budget, room kept for render targets) already scales with the budget Windows reports.
-# Extra settings can still be passed: -More @{VICTORY_CARD_BUFFERS_MB='512'}
+#   .\scripts\play-4060.ps1 -Exe <path of your own copy's executable>
+#   .\scripts\play-4060.ps1 -Exe ... -Preset safe                     512 MB of buffer copies on the card (least video memory)
+#   .\scripts\play-4060.ps1 -Exe ... -More @{VICTORY_CARD_AWAKE='1'}   add or override switches
+#
+# What each switch does is in a comment where the code reads it. The F1 menu's saved choices
+# (victory-settings.txt) go under these settings and -More.
 param(
     [Parameter(Mandatory)][string]$Exe,
-    [ValidateSet('1080', '720', '540', '480')][string]$Resolution,
-    [switch]$Quality,
-    [switch]$NoSmoothMotion,
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{},
-    [uint32]$WindowsBarMB
+    [ValidateSet('diag', 'release')][string]$Build = 'release',
+    # Buffer copies in the card's memory: safe 512 MB, balanced 1024, fast 1536, max 2048 (may spill on 8 GB).
+    # Kept in step with shadow.rs PRESETS_4060, whose test checks they fit the card's budget.
+    [ValidateSet('safe', 'balanced', 'fast', 'max')][string]$Preset = 'balanced',
+    [switch]$Preload,
+    [hashtable]$More = @{}
 )
-$fit8gb = @{
-    VICTORY_CARD_BUFFERS_MB = '768'
+$cards = @{ safe = '512'; balanced = '1024'; fast = '1536'; max = '2048' }
+$settings = @{
+    VICTORY_CARD_BUFFERS_MB = $cards[$Preset]
+    # Measured by 8 GB users of VIctory-NVIDIA: the constants heap in place (about +8 %), 768 MB of title windows
+    # on the card (about +15 %).
+    VICTORY_PORT_CONSTANTS = '1'
+    VICTORY_CARD_WINDOWS_MB = '768'
+    # Helped on a 6-core Intel PC (VIctory-NVIDIA #526): four list threads, and the card not kept awake.
+    VICTORY_THIN_THREADS = '4'
+    VICTORY_CARD_AWAKE = '0'
 }
-foreach ($k in $More.Keys) { $fit8gb[$k] = $More[$k] }
-$splat = @{ Exe = $Exe; More = $fit8gb; Build = $Build; Quality = $Quality; NoSmoothMotion = $NoSmoothMotion }
-if ($Resolution) { $splat.Resolution = $Resolution }
-if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
-    $splat.WindowsBarMB = $WindowsBarMB
-} else {
-    $ram = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { 0 }
-    if ($ram -gt 0 -and $ram -lt 24GB) { $splat.WindowsBarMB = [uint32]1536 }
-}
-& (Join-Path $PSScriptRoot 'play-nvidia.ps1') @splat
+foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+$foxhound = @{ Exe = $Exe; Build = $Build; SeriesS = $true; Dlss = 'off'; More = $settings }
+if ($Preload) { $foxhound.Preload = $true }
+& (Join-Path $PSScriptRoot 'play-foxhound.ps1') @foxhound

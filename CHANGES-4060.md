@@ -1,52 +1,34 @@
-# nvidia-4060: what's in this branch and why
+# nvidia-4060-on-nv-main
 
-EXPERIMENTAL, AI-assisted (Claude), not yet run against the game. Do not treat it as working.
+Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small set of changes for an 8 GB card
+(RTX 4060) on an Intel PC. Not yet measured in game; each change below is kept only if it measurably helps.
 
-Base: trustno1-coder/VIctory-NVIDIA at 7480e96 (Series S, half render scale, ray tracing mostly off, card-side memory
-compares; 18-22 fps measured by its author on a 12 GB RTX 5070). Goal: fit that in an 8 GB card (RTX 4060).
+## 8 GB card (on by default; each has a switch)
 
-Rule for adding anything: it must fix or prevent something specific on an 8 GB NVIDIA card.
+- Small-card lines (`VICTORY_SMALL_CARD_LINES=0` backs out): on budgets of 9 GiB or less the texture line is 94 %,
+  render-target room at most a quarter of the budget, room for card buffer copies at most a sixteenth.
+- Texture room only while the card is under its budget (edupode a0ead598): free parts of mostly empty blocks no
+  longer count as room once the card is past it.
+- List upload buffers pooled (edupode 62bba05, `VICTORY_UPLOAD_POOL=0` backs out).
+- Texture pool: 3 spare 64 MiB blocks kept on small cards (64 before, 4 GiB), 2 made ahead (`VICTORY_RIPE_BLOCKS`).
+- Ray tracing pages by address: at most 1 GiB on small cards (`VICTORY_RT_MEMORY_MB`).
+- Tile floor 256 KiB under 9 GiB; opt-in top-mip cap (`VICTORY_LEVELS_MAX_DIM`) and tile reclaim
+  (`VICTORY_LEVELS_RECLAIM=1`), both off.
 
-## Merged
+## Intel (off by default)
 
-| Change | Source | Why on 8 GB NVIDIA |
-| --- | --- | --- |
-| Device-removal report names the call that removed it | potatoe0100 `nvidia/removal-names-its-trigger` | Crash reports from testers say what failed, so fixes can be targeted |
-| `scripts/play-4060.ps1` | this branch | The fork's launcher keeps 1536 MB of card-side buffer copies (sized on 12 GB); this uses 768 MB |
-| `scripts/sync-4060.ps1` | this branch | Follows VIctory-NVIDIA and lists new upstream GPU commits to port |
+- `VICTORY_SUBMIT_CORE=1`: the submitting thread gets a fast physical core to itself (2: the process's other
+  threads kept off it too).
+- (Our branch's pin shift and spread are diagnostics-build only and are left out here.)
 
-## Already in the base (not merged again)
+## Launcher
 
-| Upstream PR | What the fork has instead |
-| --- | --- |
-| #2461 NVIDIA view heap cap | Own `probe_view_limit`: shaders clamp view indices to the capped heap's null slot, and `VICTORY_DYNAMIC_SLOTS` takes more dynamic slots on a capped heap. The heap tests that fail on upstream main all pass here on the 4060. |
-| #1215 fast copy-back | `NtWriteVirtualMemory` copy-back in `host.rs` |
-| Texture budget | `VICTORY_TEXTURE_BUDGET_MB`, and by default textures stop at 90% of the budget Windows reports |
+`scripts/play-4060.ps1`: play-foxhound.ps1 with the Series S profile, its own upscaling, `-Preset
+safe|balanced|fast|max` (512 to 2048 MB of buffer copies; a test checks they fit the card's budget), and the
+settings 8 GB users measured: `VICTORY_PORT_CONSTANTS=1`, `VICTORY_CARD_WINDOWS_MB=768`, `VICTORY_THIN_THREADS=4`,
+`VICTORY_CARD_AWAKE=0`.
 
-## Left out
+## Other
 
-| PR | Why |
-| --- | --- |
-| #2875 loose windows in GPU_UPLOAD | No budget check: on 8 GB it can push the card past its budget |
-| Merging upstream main | About 600 clashing spots with the fork; ported piece by piece instead (`sync-4060.ps1`) |
-
-## Tests on the RTX 4060 (driver 621.14, Windows 11)
-
-`cargo test --workspace --locked --no-fail-fast -- --test-threads=1 --skip heap_direct_texture_reads_mark_their_heap_index`
-
-| Build | Passed | Failed | Ignored |
-| --- | --- | --- | --- |
-| VIctory-NVIDIA 7480e96 (base) | 927 | 0 | 45 |
-| nvidia-4060 (with the crash-report fix) | 931 | 0 | 45 |
-
-Also on the 4060:
-- `levels_on_demand_on_the_card` (ignored by default; `VICTORY_TILES_TEST_CARD=1`, release): all steps passed on the
-  card, tiled resources tier 4, debug layer on. So `VICTORY_LEVELS_ON_DEMAND=1` is safe to try on this card.
-- `the_8gb_launcher_settings_fit_the_reported_budget`: budget 7,188 MiB with the desktop running; card buffers 768 +
-  render targets 3,072 + texture floor 1,797 = 5,637 MiB, under the 90% line of 6,469 MiB.
-
-## Also left out
-
-| Branch | Why |
-| --- | --- |
-| `nvidia-xtx-ports` (zero-copy renderer ports 5-7) | Brings in avatarmanz/VIctory-7900XTX up to c9c932c, which merges code from codec-d/cool_fox (commit a12870a), a CGBJ-derived source this branch does not use. The ports are off by default and save CPU copy time, not video memory. |
+- A removal report names the call that removed the device.
+- `release-lto` / `diag-lto` profiles (thin LTO, one codegen unit) for A/B.

@@ -1891,9 +1891,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // The free part of the texture blocks counts as room only while the
+        // card is under its budget: it is mostly holes in blocks a quarter
+        // full or less, which new textures seldom fit, so they took new
+        // blocks while the card stood past its budget (VI-9XWS-MD9U, RX 7600
+        // 8 GB, 28/11/2026: 8,315 MB in use of 6,610, 2,483 MB "free" in
+        // blocks, "room"; 7 GB moved into the PC's memory, which then ran
+        // out and the game ended).
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < room_line(budget)
+            used < budget
+                && used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+                    < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1931,10 +1939,9 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+        let set = std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        targets_most(set, budget)
     });
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let settle = *SETTLE.get_or_init(|| {
@@ -1954,6 +1961,46 @@ pub(crate) fn targets_room_kept() -> u64 {
     GREW[0].store(last, Relaxed);
     GREW[1].store(since, Relaxed);
     targets_kept(most, targets, now.saturating_sub(since), settle)
+}
+
+/// The most [`targets_room_kept`] keeps: `VICTORY_CARD_ROOM_FOR_TARGETS_MB`
+/// (`set`, at most 8,192) if given, else 3,072 MiB, at most a quarter of
+/// the budget on a small card ([`small_card_lines`]): on an RTX 4060's
+/// 6.2 GB budget 3,072 MiB was half of it, and the textures picked by index
+/// waited for room with the card 41 % used (2026-11-27).
+#[cfg(any(windows, test))]
+pub(crate) fn targets_most(set: Option<u64>, budget: Option<u64>) -> u64 {
+    const MOST: u64 = 3072 << 20;
+    match (set, budget) {
+        (Some(mb), _) => mb.min(8192) << 20,
+        (None, Some(budget)) if small_card_lines(budget) => MOST.min(budget / 4),
+        _ => MOST,
+    }
+}
+
+/// The budgets of 8 GB cards (an RTX 4060 reports 6.2 to 7.2 GB, less what
+/// other programs hold) and below.
+#[cfg(any(windows, test))]
+pub(crate) const SMALL_CARD: u64 = 9 << 30;
+
+/// Whether the card's lines and reserves are the small card's
+/// ([`SMALL_CARD`]): the texture line at 94 % ([`room_line`]), and so the
+/// sweep's (`crate::host::vram_keep_below`), at most a quarter of the
+/// budget kept for render targets ([`targets_most`]) and at most a
+/// sixteenth of it for card copies not made yet
+/// (`crate::shadow::card_room_kept`). On with the room guard ([`room`]:
+/// the card under its budget, after edupode a0ead598);
+/// `VICTORY_SMALL_CARD_LINES=0`: the lines of every card, as before.
+///
+/// Why (RTX 4060, 2026-11-28, 6,248 MB budget): textures picked by index
+/// waited for room at 5,529 MB in use; at 90 % with both reserves counted
+/// as used the queue stopped at about 5.2 to 5.5 GB.
+#[cfg(any(windows, test))]
+pub(crate) fn small_card_lines(budget: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    budget > 0
+        && budget <= SMALL_CARD
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_CARD_LINES").is_none_or(|v| v != "0"))
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -2054,6 +2101,8 @@ pub(crate) fn room_line(budget: u64) -> u64 {
     static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
         budget / 100 * room_percent()
+    } else if small_card_lines(budget) {
+        budget / 100 * 94
     } else {
         line_for(budget)
     }
@@ -5202,6 +5251,23 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// On small cards at most a quarter of the budget is kept for render
+    /// targets; the switch sets it on every card.
+    #[test]
+    fn small_cards_keep_less_for_targets() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        if small_card_lines(8 * GIB) {
+            assert_eq!(targets_most(None, Some(6248 * MIB)), 6248 * MIB / 4);
+        }
+        assert_eq!(targets_most(None, Some(16 * GIB)), 3072 * MIB);
+        assert_eq!(targets_most(None, None), 3072 * MIB);
+        assert_eq!(targets_most(Some(512), Some(6 * GIB)), 512 * MIB);
+        assert_eq!(targets_most(Some(9000), None), 8192 * MIB);
+        assert!(!small_card_lines(10 * GIB));
+        assert!(!small_card_lines(0));
     }
 
     /// The texture queue's line: the budget less 768 MiB or 5 %, never under

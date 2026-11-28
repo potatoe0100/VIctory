@@ -316,8 +316,26 @@ pub(crate) fn card_room_kept() -> u64 {
     // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let budget = *BUDGET.get_or_init(|| crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget));
+    card_room_kept_bytes(
+        card_limits().1,
+        CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed),
+        budget.filter(|&b| crate::resource::small_card_lines(b)),
+    )
+}
+
+/// [`card_room_kept`]: of `most` bytes of card copies, at most 1 GiB (no
+/// session's came to more), less `taken` (made, or refused for good); on a
+/// small card (`small_budget`, its budget: `crate::resource::small_card_lines`)
+/// also at most a sixteenth of the budget. On an RTX 4060 (6,248 MB budget,
+/// 1,024 MB of copies) the whole unused part of the copies' budget was kept
+/// from the textures, which then waited for room with about 700 MB of the
+/// card free (2026-11-28); a sixteenth is 390 MB.
+fn card_room_kept_bytes(most: u64, taken: u64, small_budget: Option<u64>) -> u64 {
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    let cap = small_budget.map_or(SEEN, |budget| SEEN.min(budget / 16));
+    most.min(cap).saturating_sub(taken)
 }
 
 /// The copies in the card's memory.
@@ -6007,6 +6025,58 @@ mod window_tests {
         assert_eq!(super::default_window_card_mb(Some(8 * GIB)), 737);
         assert_eq!(super::default_window_card_mb(Some(11229 << 20)), 1010);
         assert_eq!(super::default_window_card_mb(Some(24 * GIB)), 1024);
+    }
+
+    /// The room kept for card copies not made yet: at most 1 GiB, and a
+    /// sixteenth of an 8 GB card's budget.
+    #[test]
+    fn card_room_kept_is_capped_on_small_cards() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(super::card_room_kept_bytes(1024 * MIB, 0, None), 1024 * MIB);
+        assert_eq!(super::card_room_kept_bytes(2048 * MIB, 100 * MIB, None), 924 * MIB);
+        assert_eq!(super::card_room_kept_bytes(1024 * MIB, 0, Some(6248 * MIB)), 390 * MIB + 512 * 1024);
+        assert_eq!(super::card_room_kept_bytes(1024 * MIB, 500 * MIB, Some(6248 * MIB)), 0);
+    }
+
+    /// `scripts/play-4060.ps1`'s presets: name and MiB of card buffer copies
+    /// (keep in step with the script).
+    const PRESETS_4060: [(&str, u64); 4] = [("balanced", 1024), ("safe", 512), ("fast", 1536), ("max", 2048)];
+
+    /// Each of `scripts/play-4060.ps1`'s presets: its card buffer copies, the
+    /// most kept for render targets and the texture floor fit under the
+    /// textures' line of the budget this machine's card reports, and of that
+    /// budget less 1 GiB; printed, so a run on an 8 GB card shows its numbers.
+    #[cfg(windows)]
+    #[test]
+    fn the_8gb_launcher_settings_fit_the_reported_budget() {
+        const MIB: u64 = 1 << 20;
+        let Some([reported, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let mut misfits = Vec::new();
+        for (name, mb) in PRESETS_4060 {
+            for (what, budget) in [("", reported), (", 1 GiB less free", reported.saturating_sub(1 << 30))] {
+                let (_, card) = resolve_card_limits(Some(budget), None, Some(mb));
+                let targets = crate::resource::targets_most(None, Some(budget));
+                let floor = (2u64 << 30).min(budget / 4);
+                let line = crate::resource::room_line(budget);
+                eprintln!(
+                    "video memory budget {} MiB{what} (in use {} MiB), preset {name}: card buffers {} + render targets {} + texture floor {} = {} MiB, line {} MiB",
+                    budget / MIB,
+                    used / MIB,
+                    card / MIB,
+                    targets / MIB,
+                    floor / MIB,
+                    (card + targets + floor) / MIB,
+                    line / MIB
+                );
+                if card + targets + floor >= line {
+                    misfits.push(format!("{name}{what}"));
+                }
+            }
+        }
+        assert!(misfits.is_empty(), "the 8 GB presets do not fit this card's budget: {misfits:?}");
     }
 
     /// An ask that may take any window takes the longest that holds all of

@@ -71,9 +71,40 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => spare_kept_for(budget),
         _ => SPARE,
     }
+}
+
+/// Empty 64 MiB blocks kept while there is room: on cards of 9 GiB or less
+/// ([`crate::resource::SMALL_CARD`]) 3 (192 MiB), up to 12 GiB 8, else
+/// [`SPARE_KEPT`] (64, 4 GiB: more than half an 8 GB card's budget).
+fn spare_kept_for(budget: u64) -> usize {
+    const GIB: u64 = 1 << 30;
+    if budget == 0 {
+        SPARE_KEPT
+    } else if budget <= 9 * GIB {
+        3
+    } else if budget <= 12 * GIB {
+        8
+    } else {
+        SPARE_KEPT
+    }
+}
+
+/// Blocks made ahead by default: 2 on cards of 9 GiB or less, 4 up to
+/// 12 GiB, else 12 (`VICTORY_RIPE_BLOCKS` sets it).
+fn default_ripe_blocks(vram_budget: Option<u64>) -> usize {
+    const GIB: u64 = 1 << 30;
+    match vram_budget {
+        Some(budget) if budget > 0 && budget <= 9 * GIB => 2,
+        Some(budget) if budget > 0 && budget <= 12 * GIB => 4,
+        _ => 12,
+    }
+}
+
+fn ripe_blocks_for(override_val: Option<usize>, vram_budget: Option<u64>) -> usize {
+    override_val.unwrap_or_else(|| default_ripe_blocks(vram_budget))
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -104,7 +135,11 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        let set = std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok());
+        let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        ripe_blocks_for(set, budget)
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -927,7 +962,16 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), 3);
+        const GIB: u64 = 1 << 30;
+        assert_eq!(spares(Some([8 * GIB, 4 * GIB, 0, 0]), true), 3);
+        assert_eq!(spares(Some([12 * GIB, 4 * GIB, 0, 0]), true), 8);
+        assert_eq!(spares(Some([24 * GIB, 4 * GIB, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([8 * GIB, 7 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(ripe_blocks_for(None, Some(8 * GIB)), 2);
+        assert_eq!(ripe_blocks_for(None, Some(12 * GIB)), 4);
+        assert_eq!(ripe_blocks_for(None, None), 12);
+        assert_eq!(ripe_blocks_for(Some(6), Some(8 * GIB)), 6);
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
