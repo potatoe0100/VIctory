@@ -36,6 +36,8 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
 - NV #834: a write-watch race that crashed with an access violation.
 - NV #825: card awake runs only in gameplay frames.
 - 507kazz af12d460: finished submissions freed off the relay (16-33 ms a frame there; `VICTORY_BURY_ASIDE=0` backs out).
+- 16 MiB texture blocks on budgets up to 8.5 GiB (`VICTORY_TEXTURE_BLOCK_MB=64` backs out; the startup log names
+  the size).
 
 ## Intel (off by default)
 
