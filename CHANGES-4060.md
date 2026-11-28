@@ -16,7 +16,8 @@ Experimental, AI-assisted (Claude). VIctory-NVIDIA main (63b902fe) plus a small 
 - Texture room only while the card is under its budget (edupode a0ead598): free parts of mostly empty blocks no
   longer count as room once the card is past it.
 - List upload buffers pooled (edupode 62bba05, `VICTORY_UPLOAD_POOL=0` backs out).
-- Texture pool: 3 spare 64 MiB blocks kept on small cards (64 before, 4 GiB), 2 made ahead (`VICTORY_RIPE_BLOCKS`).
+- Texture pool: 2 blocks made ahead on small cards (`VICTORY_RIPE_BLOCKS`; play-foxhound.ps1 sets 0). Spare blocks
+  scale with the card through NV #784 (`VICTORY_SPARE_SCALE=1`).
 - Ray tracing pages by address: at most 1 GiB on small cards (`VICTORY_RT_MEMORY_MB`).
 - Tile floor 256 KiB under 9 GiB; opt-in top-mip cap (`VICTORY_LEVELS_MAX_DIM`) and tile reclaim
   (`VICTORY_LEVELS_RECLAIM=1`), both off.

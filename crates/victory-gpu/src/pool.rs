@@ -87,24 +87,8 @@ fn texture_spares(memory: Option<[u64; 4]>, limit: usize, scale: bool) -> usize 
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => spare_kept_for(budget),
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
-    }
-}
-
-/// Empty 64 MiB blocks kept while there is room: on cards of 9 GiB or less
-/// ([`crate::resource::SMALL_CARD`]) 3 (192 MiB), up to 12 GiB 8, else
-/// [`SPARE_KEPT`] (64, 4 GiB: more than half an 8 GB card's budget).
-fn spare_kept_for(budget: u64) -> usize {
-    const GIB: u64 = 1 << 30;
-    if budget == 0 {
-        SPARE_KEPT
-    } else if budget <= 9 * GIB {
-        3
-    } else if budget <= 12 * GIB {
-        8
-    } else {
-        SPARE_KEPT
     }
 }
 
@@ -978,12 +962,8 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), 3);
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
         const GIB: u64 = 1 << 30;
-        assert_eq!(spares(Some([8 * GIB, 4 * GIB, 0, 0]), true), 3);
-        assert_eq!(spares(Some([12 * GIB, 4 * GIB, 0, 0]), true), 8);
-        assert_eq!(spares(Some([24 * GIB, 4 * GIB, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([8 * GIB, 7 * GIB, 0, 0]), true), SPARE);
         assert_eq!(ripe_blocks_for(None, Some(8 * GIB)), 2);
         assert_eq!(ripe_blocks_for(None, Some(12 * GIB)), 4);
         assert_eq!(ripe_blocks_for(None, None), 12);
