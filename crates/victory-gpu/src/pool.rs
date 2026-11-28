@@ -785,11 +785,20 @@ mod tests {
         assert_eq!(spares(Some([24 * GIB, 2 * GIB, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
 
-        let budgets = [(1u64, SPARE), (8, 4), (12, 6), (16, 8), (24, 12), (256, SPARE_KEPT)];
-        for (gib, scaled) in budgets {
+        // With room: our tiers by the budget (3, 8 or SPARE_KEPT), and with
+        // the scale switch at most a thirty-second of the budget as well.
+        let budgets = [
+            (1u64, 3, SPARE),
+            (8, 3, 3),
+            (12, 8, 6),
+            (16, SPARE_KEPT, 8),
+            (24, SPARE_KEPT, 12),
+            (256, SPARE_KEPT, SPARE_KEPT),
+        ];
+        for (gib, tier, scaled) in budgets {
             let budget = gib << 30;
             for (percent, legacy, expected) in [
-                (84, SPARE_KEPT, scaled),
+                (84, tier, scaled),
                 (85, SPARE, SPARE),
                 (86, SPARE, SPARE),
             ] {
